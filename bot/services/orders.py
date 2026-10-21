@@ -1,0 +1,364 @@
+"""Заявки: оформление клиентом, выполнение исполнителем, управление администратором."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Callable
+
+from bot.db.connection import IntegrityError
+from bot.db.repositories import Repositories
+from bot.domain.enums import (
+    FAIL_REASON_TITLES,
+    ORDER_STATUS_TITLES,
+    DistributionMode,
+    FailReason,
+    OrderStatus,
+    Role,
+)
+from bot.domain.errors import (
+    AccessDenied,
+    AlreadyOrdered,
+    InvalidTransition,
+    NoAddress,
+    NoSubscription,
+    NotFound,
+    OutsideSchedule,
+    ValidationError,
+)
+from bot.domain.models import Actor, Order, Service, StatusHistoryEntry, User
+from bot.domain.schedule import accepting_shift, current_shift, last_shift_date, next_shift
+from bot.domain.transitions import ORDER_ACTIVE_STATUSES, ORDER_FINAL_STATUSES, order_transition_allowed
+
+from .access import require_active, require_admin, require_executor
+from .settings import SettingsService
+from .tariffs import CatalogService
+
+O = OrderStatus
+
+WEEKDAYS_GENITIVE = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
+
+
+@dataclass
+class OrderChange:
+    """Результат изменения заказа — всё, что нужно для уведомлений."""
+
+    order: Order
+    previous_executor_id: int | None = None
+
+
+class ExecutorView:
+    NEW = "new"  # общий пул (только в режиме POOL)
+    ASSIGNED = "assigned"
+    IN_WORK = "in_work"
+    DONE_SHIFT = "done_shift"
+    HISTORY = "history"
+
+
+class OrderService:
+    def __init__(
+        self,
+        repos: Repositories,
+        settings: SettingsService,
+        catalog: CatalogService,
+        clock: Callable[[], datetime],
+    ):
+        self.repos = repos
+        self.settings = settings
+        self.catalog = catalog
+        self._now = clock
+
+    # ------------------------------------------------------------------ клиент
+
+    async def current_shift_orders(self, user_id: int, service: Service) -> list[Order]:
+        shift = current_shift(self._now(), await self.settings.schedule(service))
+        if not shift:
+            return []
+        return await self.repos.orders.list_for_shift(user_id, service.id, shift.shift_date)
+
+    async def check_can_order(self, actor: Actor, service: Service) -> date:
+        """Проверяет все условия оформления заявки; возвращает дату смены."""
+        require_active(actor)
+        if not service.is_active:
+            raise ValidationError("Услуга временно недоступна.")
+        now = self._now()
+        schedule = await self.settings.schedule(service)
+        shift = current_shift(now, schedule)
+
+        if shift:
+            existing = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift.shift_date)
+            if existing:
+                allowed = service.max_orders_per_shift + await self.repos.orders.count_exceptions(
+                    actor.user.id, service.id, shift.shift_date
+                )
+                if len(existing) >= allowed:
+                    raise AlreadyOrdered(existing[-1])
+
+        address = await self.repos.user_addresses.get_current(actor.user.id)
+        if not address:
+            raise NoAddress()
+        if service.rules.get("requires_subscription", True):
+            if not await self.repos.subscriptions.get_active_at(actor.user.id, service.id, now):
+                raise NoSubscription()
+
+        accepting = accepting_shift(now, schedule)
+        if not accepting:
+            raise OutsideSchedule(self._schedule_message(now, schedule, shift))
+        return accepting.shift_date
+
+    def _schedule_message(self, now: datetime, schedule, shift) -> str:
+        start = schedule.accept_start.strftime("%H:%M")
+        end = schedule.accept_end.strftime("%H:%M")
+        if shift:
+            text = f"Приём заявок на текущую смену завершён в {end}."
+        else:
+            text = f"Сейчас заявки не принимаются. Приём — в рабочие дни с {start} до {end}."
+        upcoming = next_shift(now, schedule)
+        if upcoming:
+            local = upcoming.starts_at.astimezone(schedule.tz)
+            if local.date() == now.astimezone(schedule.tz).date():
+                when = f"сегодня в {local:%H:%M}"
+            elif local.date() == now.astimezone(schedule.tz).date() + timedelta(days=1):
+                when = f"завтра в {local:%H:%M}"
+            else:
+                when = f"в {WEEKDAYS_GENITIVE[local.weekday()]}, {local:%d.%m} в {local:%H:%M}"
+            text += f"\nСледующий приём заявок начнётся {when}."
+        return text
+
+    async def create_order(self, actor: Actor, service: Service) -> Order:
+        """Создаёт заявку. Повторные/одновременные нажатия не создают дубликатов."""
+        now = self._now()
+        async with self.repos.transaction():
+            shift_date = await self.check_can_order(actor, service)
+            existing = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift_date)
+            address = await self.repos.user_addresses.get_current(actor.user.id)
+            assert address is not None
+            try:
+                order_id = await self.repos.orders.create(
+                    service.id, actor.user.id, address, shift_date, attempt=len(existing), now=now
+                )
+            except IntegrityError:
+                # одновременное нажатие: заявка с этим номером попытки уже есть
+                orders = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift_date)
+                raise AlreadyOrdered(orders[-1] if orders else None) from None
+            await self.repos.orders.add_history(order_id, None, O.NEW, actor.tg_id, now, "Заявка создана клиентом")
+        order = await self.repos.orders.get(order_id)
+        assert order is not None
+        return order
+
+    async def client_orders(self, actor: Actor, limit: int = 10) -> list[Order]:
+        return await self.repos.orders.list(user_id=actor.user.id, newest_first=True, limit=limit)
+
+    async def get_for_client(self, actor: Actor, order_id: int) -> Order:
+        order = await self.repos.orders.get(order_id)
+        if not order or (order.user_id != actor.user.id and not actor.is_admin):
+            raise NotFound("Заявка не найдена.")
+        return order
+
+    # ------------------------------------------------------------- исполнитель
+
+    async def can_executor_see(self, actor: Actor, order: Order) -> bool:
+        if order.executor_id == actor.user.id:
+            return True
+        return (
+            order.status == O.NEW
+            and order.executor_id is None
+            and await self.settings.distribution_mode() == DistributionMode.POOL
+        )
+
+    async def get_for_executor(self, actor: Actor, order_id: int) -> Order:
+        require_executor(actor)
+        order = await self.repos.orders.get(order_id)
+        if not order or not await self.can_executor_see(actor, order):
+            raise NotFound("Заявка не найдена или недоступна вам.")
+        return order
+
+    async def executor_orders(self, actor: Actor, view: str) -> list[Order]:
+        require_executor(actor)
+        me = actor.user.id
+        if view == ExecutorView.NEW:
+            if await self.settings.distribution_mode() != DistributionMode.POOL:
+                return []
+            return await self.repos.orders.list(statuses=[O.NEW], unassigned=True, limit=100)
+        if view == ExecutorView.ASSIGNED:
+            return await self.repos.orders.list(statuses=[O.ASSIGNED], executor_id=me, limit=100)
+        if view == ExecutorView.IN_WORK:
+            return await self.repos.orders.list(statuses=[O.ACCEPTED, O.IN_PROGRESS], executor_id=me, limit=100)
+        if view == ExecutorView.DONE_SHIFT:
+            shift_date = last_shift_date(self._now(), await self.settings.schedule())
+            if not shift_date:
+                return []
+            return await self.repos.orders.list(statuses=[O.DONE], executor_id=me, shift_date=shift_date, limit=100)
+        if view == ExecutorView.HISTORY:
+            return await self.repos.orders.list(
+                statuses=list(ORDER_FINAL_STATUSES), executor_id=me, newest_first=True, limit=30
+            )
+        raise ValidationError("Неизвестный список заявок.")
+
+    async def executor_accept(self, actor: Actor, order_id: int) -> Order:
+        require_executor(actor)
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_executor(actor, order_id)
+            if order.status == O.NEW:
+                ok = await self.repos.orders.transition(
+                    order.id, [O.NEW], O.ACCEPTED, expected_executor=None,
+                    executor_id=actor.user.id, assigned_at=now, accepted_at=now,
+                )
+                if not ok:
+                    raise InvalidTransition("Заявку уже взял другой исполнитель.")
+            else:
+                await self._executor_step(actor, order, [O.ASSIGNED], O.ACCEPTED, accepted_at=now)
+            await self.repos.orders.add_history(order.id, order.status, O.ACCEPTED, actor.tg_id, now, None)
+        return await self._reload(order_id)
+
+    async def executor_start(self, actor: Actor, order_id: int) -> Order:
+        require_executor(actor)
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_executor(actor, order_id)
+            await self._executor_step(actor, order, [O.ACCEPTED], O.IN_PROGRESS, started_at=now)
+            await self.repos.orders.add_history(order.id, order.status, O.IN_PROGRESS, actor.tg_id, now, None)
+        return await self._reload(order_id)
+
+    async def executor_done(self, actor: Actor, order_id: int) -> Order:
+        require_executor(actor)
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_executor(actor, order_id)
+            await self._executor_step(actor, order, [O.ACCEPTED, O.IN_PROGRESS], O.DONE, finished_at=now)
+            await self.repos.orders.add_history(order.id, order.status, O.DONE, actor.tg_id, now, None)
+        return await self._reload(order_id)
+
+    async def executor_fail(self, actor: Actor, order_id: int, reason: FailReason, comment: str | None) -> Order:
+        require_executor(actor)
+        comment = (comment or "").strip() or None
+        if reason == FailReason.OTHER and not comment:
+            raise ValidationError("Для причины «Другая причина» обязательно напишите комментарий.")
+        if comment and len(comment) > 500:
+            raise ValidationError("Комментарий не должен быть длиннее 500 символов.")
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_executor(actor, order_id)
+            await self._executor_step(
+                actor, order, [O.ASSIGNED, O.ACCEPTED, O.IN_PROGRESS], O.FAILED,
+                finished_at=now, fail_reason=reason.value, comment=comment,
+            )
+            text = FAIL_REASON_TITLES[reason] + (f": {comment}" if comment else "")
+            await self.repos.orders.add_history(order.id, order.status, O.FAILED, actor.tg_id, now, text)
+        return await self._reload(order_id)
+
+    async def _executor_step(self, actor: Actor, order: Order, expected: list[O], new: O, **fields) -> None:
+        if order.executor_id != actor.user.id:
+            raise AccessDenied("Эта заявка назначена другому исполнителю.")
+        if order.status not in expected:
+            raise InvalidTransition(
+                f"Действие недоступно: заявка в статусе «{ORDER_STATUS_TITLES[order.status_enum]}»."
+            )
+        ok = await self.repos.orders.transition(
+            order.id, [order.status], new, expected_executor=actor.user.id, **fields
+        )
+        if not ok:
+            raise InvalidTransition("Статус заявки уже изменился. Обновите карточку.")
+
+    # ---------------------------------------------------------- администратор
+
+    async def get_for_admin(self, actor: Actor, order_id: int) -> Order:
+        require_admin(actor)
+        order = await self.repos.orders.get(order_id)
+        if not order:
+            raise NotFound("Заявка не найдена.")
+        return order
+
+    async def admin_list(self, actor: Actor, **filters) -> list[Order]:
+        require_admin(actor)
+        return await self.repos.orders.list(**filters)
+
+    async def assign(self, actor: Actor, order_id: int, executor_id: int) -> OrderChange:
+        require_admin(actor)
+        executor = await self.repos.users.get(executor_id)
+        if not executor or executor.role != Role.EXECUTOR or executor.is_blocked:
+            raise ValidationError("Выбранный пользователь не является активным исполнителем.")
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_admin(actor, order_id)
+            if order.executor_id == executor_id and order.status != O.NEW:
+                raise ValidationError("Заявка уже назначена этому исполнителю.")
+            if not order_transition_allowed(order.status, O.ASSIGNED):
+                raise InvalidTransition(
+                    f"Нельзя назначить исполнителя: заявка в статусе «{ORDER_STATUS_TITLES[order.status_enum]}»."
+                )
+            ok = await self.repos.orders.transition(
+                order.id, [order.status], O.ASSIGNED, expected_executor=order.executor_id,
+                executor_id=executor_id, assigned_at=now, accepted_at=None, started_at=None,
+            )
+            if not ok:
+                raise InvalidTransition("Заявка изменилась. Обновите карточку.")
+            if order.executor_id:
+                comment = f"Переназначена исполнителю {executor.display}"
+            else:
+                comment = f"Назначена исполнителю {executor.display}"
+            await self.repos.orders.add_history(order.id, order.status, O.ASSIGNED, actor.tg_id, now, comment)
+        return OrderChange(await self._reload(order_id), previous_executor_id=order.executor_id)
+
+    async def cancel(self, actor: Actor, order_id: int, reason: str) -> OrderChange:
+        require_admin(actor)
+        reason = (reason or "").strip()
+        if not reason:
+            raise ValidationError("Укажите причину отмены.")
+        now = self._now()
+        async with self.repos.transaction():
+            order = await self.get_for_admin(actor, order_id)
+            if order.status not in ORDER_ACTIVE_STATUSES:
+                raise InvalidTransition("Завершённую заявку отменить нельзя.")
+            ok = await self.repos.orders.transition(
+                order.id, [order.status], O.CANCELLED, cancel_reason=reason, finished_at=now
+            )
+            if not ok:
+                raise InvalidTransition("Заявка изменилась. Обновите карточку.")
+            await self.repos.orders.add_history(order.id, order.status, O.CANCELLED, actor.tg_id, now, reason)
+        return OrderChange(await self._reload(order_id), previous_executor_id=order.executor_id)
+
+    async def grant_exception(self, actor: Actor, order_id: int, comment: str | None = None) -> Order:
+        """Разрешает клиенту ещё одну заявку в смену этой заявки (исключение по решению администратора)."""
+        require_admin(actor)
+        order = await self.get_for_admin(actor, order_id)
+        if order.status not in ORDER_FINAL_STATUSES:
+            raise ValidationError("Исключение можно дать только после завершения текущей заявки.")
+        now = self._now()
+        async with self.repos.transaction():
+            service = await self.catalog.service_by_id(order.service_id)
+            orders = await self.repos.orders.list_for_shift(order.user_id, order.service_id, order.shift_date)
+            allowed = service.max_orders_per_shift + await self.repos.orders.count_exceptions(
+                order.user_id, order.service_id, order.shift_date
+            )
+            if len(orders) < allowed:
+                raise ValidationError("Клиент уже может оформить ещё одну заявку в эту смену.")
+            await self.repos.orders.add_exception(
+                order.user_id, order.service_id, order.shift_date, actor.tg_id, now, comment
+            )
+            await self.repos.audit.log(
+                actor.tg_id, "order.exception", f"user_id={order.user_id}, shift={order.shift_date}", now
+            )
+        return order
+
+    async def history(self, actor: Actor, order_id: int) -> list[StatusHistoryEntry]:
+        require_admin(actor)
+        return await self.repos.orders.history(order_id)
+
+    async def mark_unassigned_alerts(self) -> list[Order]:
+        """Заявки без исполнителя дольше заданного времени (уведомление админу отправляется один раз)."""
+        minutes = await self.settings.unassigned_alert_minutes()
+        if minutes <= 0:
+            return []
+        orders = await self.repos.orders.unassigned_older_than(self._now() - timedelta(minutes=minutes))
+        await self.repos.orders.mark_unassigned_alert(o.id for o in orders)
+        return orders
+
+    async def users_by_id(self, ids) -> dict[int, User]:
+        return await self.repos.users.get_many(i for i in ids if i)
+
+    async def _reload(self, order_id: int) -> Order:
+        order = await self.repos.orders.get(order_id)
+        if not order:
+            raise NotFound("Заявка не найдена.")
+        return order
