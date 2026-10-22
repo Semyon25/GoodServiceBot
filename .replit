@@ -18,6 +18,10 @@ author = "agent"
 task = "workflow.run"
 args = "Telegram bot"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Launch tests"
+
 [[workflows.workflow]]
 name = "Telegram bot"
 author = "agent"
@@ -25,6 +29,17 @@ author = "agent"
 [[workflows.workflow.tasks]]
 task = "shell.exec"
 args = "python -m bot"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow]]
+name = "Launch tests"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "python -m pytest -q"
 
 [workflows.workflow.metadata]
 outputType = "console"
