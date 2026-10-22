@@ -39,7 +39,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "python -m pytest -q"
+args = "python -m pytest"
 
 [workflows.workflow.metadata]
 outputType = "console"
