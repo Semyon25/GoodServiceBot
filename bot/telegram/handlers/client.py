@@ -8,6 +8,7 @@ from aiogram.types import CallbackQuery, Message
 from bot.domain.enums import PaymentStatus
 from bot.domain.errors import AlreadyOrdered, DomainError, NoAddress, NoSubscription, PaymentPending, ValidationError
 from bot.domain.models import Actor
+from bot.domain.schedule import pickup_when_text
 from bot.services import Services
 from bot.services.users import parse_apartment, parse_floor, parse_instructions, parse_intercom
 
@@ -129,7 +130,7 @@ async def address_apartment(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(apartment=apartment)
     await state.set_state(AddressForm.intercom)
-    await message.answer("Шаг 5 из 6. Напишите код домофона (как его набирать):")
+    await message.answer("Шаг 5 из 6. Напишите код домофона:")
 
 
 @router.message(AddressForm.intercom, F.text, NOT_MENU)
@@ -245,14 +246,14 @@ async def _tariffs_view(actor: Actor, services: Services) -> tuple[str, object]:
     open_payment = await services.payments.open_payment(actor.user.id, service.id)
     if open_payment and open_payment.status == PaymentStatus.AWAITING_CONFIRMATION:
         lines.append(
-            f"\n⏳ Ваш платёж №{open_payment.id} на {open_payment.amount_rub} ₽ ожидает подтверждения администратором. "
+            f"\n⏳ Ваша оплата на {open_payment.amount_rub} ₽ ожидает подтверждения администратором. "
             "Повторно оплачивать не нужно."
         )
     else:
         if open_payment:
-            lines.append(f"\nЕсть неоплаченный платёж №{open_payment.id} на {open_payment.amount_rub} ₽.")
+            lines.append(f"\nВы начали оплату «{t.h(open_payment.tariff_title)}» на {open_payment.amount_rub} ₽.")
             buttons.append(
-                (f"➡️ Продолжить оплату №{open_payment.id}", TariffCb(action="pick", tariff_id=open_payment.tariff_id).pack())
+                (f"➡️ Продолжить оплату ({open_payment.amount_rub} ₽)", TariffCb(action="pick", tariff_id=open_payment.tariff_id).pack())
             )
         buttons += [
             (f"{tr.title} — {tr.price_rub} ₽", TariffCb(action="pick", tariff_id=tr.id).pack()) for tr in tariffs
@@ -344,7 +345,7 @@ async def payment_proof(message: Message, state: FSMContext, actor: Actor, servi
         await message.answer("Этот платёж уже передан на проверку. Дождитесь решения администратора.")
         return
     await message.answer(
-        f"Спасибо! Платёж №{payment.id} передан на проверку администратору.\n"
+        "Спасибо! Оплата передана на проверку администратору.\n"
         "Статус: «Ожидает подтверждения». Мы сообщим, как только оплата будет подтверждена."
     )
     await notifier.payment_submitted(payment, actor.user)
@@ -369,8 +370,8 @@ async def my_subscription(message: Message, state: FSMContext, actor: Actor, ser
     if active:
         lines.append(
             f"✅ Подписка активна: <b>{t.h(active.tariff_title)}</b>\n"
-            f"Начало: {t.fmt_dt(active.starts_at, services.tz)}\n"
-            f"Окончание: {t.fmt_dt(active.ends_at, services.tz)}"
+            f"Начало: {t.subscription_first_day(active, services.tz)}\n"
+            f"Окончание: {t.subscription_last_day(active, services.tz)} (включительно)"
         )
     else:
         lines.append("Действующей подписки нет.")
@@ -380,7 +381,7 @@ async def my_subscription(message: Message, state: FSMContext, actor: Actor, ser
         lines += [t.subscription_line(s, services.tz, now) for s in future]
     open_payment = await services.payments.open_payment(actor.user.id, service.id)
     if open_payment:
-        lines.append(f"\nПлатёж №{open_payment.id} на {open_payment.amount_rub} ₽: {t.payment_status(open_payment)}.")
+        lines.append(f"\nОплата на {open_payment.amount_rub} ₽: {t.payment_status(open_payment)}.")
     await message.answer(
         "\n".join(lines), reply_markup=rows([("💳 Тарифы и оплата", TariffCb(action="list").pack())])
     )
@@ -394,13 +395,15 @@ async def order_start(message: Message, state: FSMContext, actor: Actor, service
     await state.clear()
     service = await services.catalog.service()
     try:
-        await services.orders.check_can_order(actor, service)
+        shift_date = await services.orders.check_can_order(actor, service)
     except DomainError as exc:
         await _order_refusal(message, exc, actor, services)
         return
     address = await services.addresses.current(actor.user.id)
+    when = pickup_when_text(shift_date, services.clock(), await services.settings.schedule(service))
     await message.answer(
-        "Выставьте пакет с мусором у двери квартиры и нажмите кнопку ниже.\n\n" + t.address_text(address),
+        "Выставьте пакет с мусором у двери квартиры и нажмите кнопку ниже.\n"
+        f"Мусор заберём {when}.\n\n" + t.address_text(address),
         reply_markup=rows([("🗑 Мусор выставлен — забрать", OrderCb(action="placed").pack())]),
     )
 
@@ -408,8 +411,8 @@ async def order_start(message: Message, state: FSMContext, actor: Actor, service
 async def _order_refusal(message: Message, exc: DomainError, actor: Actor, services: Services) -> None:
     if isinstance(exc, AlreadyOrdered) and exc.order:
         await message.answer(
-            "Заявка на текущую смену уже создана. Повторный заказ в эту смену невозможен.\n\n"
-            + t.order_card(exc.order, services.tz),
+            "Вы уже заказали вынос мусора — повторно заказывать не нужно.\n\n"
+            + t.client_order_card(exc.order, await services.settings.schedule(), services.clock()),
             reply_markup=client_order_kb(exc.order),
         )
         return
@@ -418,7 +421,7 @@ async def _order_refusal(message: Message, exc: DomainError, actor: Actor, servi
         pending = await services.payments.open_payment(actor.user.id, service.id)
         if pending and pending.status == PaymentStatus.AWAITING_CONFIRMATION:
             await message.answer(
-                f"⏳ Ваша оплата (платёж №{pending.id}) ожидает подтверждения администратором. "
+                "⏳ Ваша оплата ожидает подтверждения администратором. "
                 "Заказ станет доступен сразу после подтверждения."
             )
             return
@@ -463,9 +466,11 @@ async def order_confirm(callback: CallbackQuery, actor: Actor, services: Service
         await _order_refusal(callback.message, exc, actor, services)
         return
     await callback.answer("Заявка создана")
-    await respond(callback, t.order_card(order, services.tz, title=f"✅ <b>Заявка №{order.id} создана</b>"),
-                  client_order_kb(order))
-    await notifier.order_created(order, actor.user)
+    card = t.client_order_card(
+        order, await services.settings.schedule(service), services.clock(), title="✅ <b>Заявка на вынос мусора создана</b>"
+    )
+    await respond(callback, card, client_order_kb(order))
+    await notifier.order_created(order)
 
 
 # ============================================================ мои заказы
@@ -477,8 +482,8 @@ async def _orders_list(actor: Actor, services: Services) -> tuple[str, object]:
         return "У вас пока нет заказов.", None
     lines = ["<b>Ваши последние заказы</b>"]
     for o in orders:
-        lines.append(f"№{o.id} · {t.fmt_date(o.shift_date)} · {t.order_status(o)}")
-    buttons = [(f"№{o.id} · {o.shift_date:%d.%m} · {t.order_status(o)}", OrderCb(action="view", order_id=o.id).pack())
+        lines.append(f"{t.fmt_date(o.shift_date)} · {t.client_status(o)}")
+    buttons = [(f"{o.shift_date:%d.%m} · {t.client_status(o)}", OrderCb(action="view", order_id=o.id).pack())
                for o in orders]
     return "\n".join(lines), build(buttons, width=1)
 
@@ -501,7 +506,8 @@ async def my_orders_cb(callback: CallbackQuery, actor: Actor, services: Services
 async def order_view(callback: CallbackQuery, callback_data: OrderCb, actor: Actor, services: Services) -> None:
     order = await services.orders.get_for_client(actor, callback_data.order_id)
     await callback.answer()
-    await respond(callback, t.order_card(order, services.tz), client_order_kb(order))
+    card = t.client_order_card(order, await services.settings.schedule(), services.clock())
+    await respond(callback, card, client_order_kb(order))
 
 
 # ================================================================ помощь
@@ -510,10 +516,8 @@ async def order_view(callback: CallbackQuery, callback_data: OrderCb, actor: Act
 @router.message(F.text == t.BTN_HELP)
 async def help_(message: Message, state: FSMContext, services: Services) -> None:
     await state.clear()
-    text = t.h(await services.settings.get("texts.help", ""))
-    schedule = await services.settings.schedule()
     await message.answer(
-        f"{text}\n\n<b>Расписание</b>\n{t.schedule_text(schedule)}",
+        t.h(await services.settings.text("texts.help")),
         reply_markup=rows([("✉️ Написать администратору", SupportCb(action="write").pack())]),
     )
 

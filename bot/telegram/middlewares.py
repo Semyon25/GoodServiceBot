@@ -60,8 +60,10 @@ class IsAdmin(Filter):
 
 
 class IsExecutor(Filter):
+    """Исполнители и администраторы (администратор всегда может выполнять заявки)."""
+
     async def __call__(self, event: TelegramObject, actor: Actor | None = None) -> bool:
-        return bool(actor and actor.user.is_executor and not actor.user.is_blocked)
+        return bool(actor and (actor.is_admin or (actor.user.is_executor and not actor.user.is_blocked)))
 
 
 class IsClient(Filter):

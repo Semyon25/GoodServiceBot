@@ -83,7 +83,7 @@ async def _card(payment_id: int, actor: Actor, services: Services) -> tuple[str,
     text = t.payment_card(payment, services.tz, client)
     sub = await services.repos.subscriptions.get_by_payment(payment.id)
     if sub:
-        text += (f"\n\nПодписка: {t.fmt_dt(sub.starts_at, services.tz)} — {t.fmt_dt(sub.ends_at, services.tz)}"
+        text += (f"\n\nПодписка: {t.subscription_period(sub, services.tz)}"
                  f" ({sub.status})")
     return text, admin_payment_kb(payment)
 

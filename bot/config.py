@@ -16,7 +16,7 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    admin_ids: frozenset[int]
+    admin_ids: tuple[int, ...]  # порядок важен: на первого назначаются заявки по умолчанию
     db_path: Path
     timezone: ZoneInfo
     log_level: str
@@ -24,17 +24,19 @@ class Config:
     proxy_url: str | None = None
 
 
-def _parse_admin_ids(raw: str) -> frozenset[int]:
-    ids: set[int] = set()
+def _parse_admin_ids(raw: str) -> tuple[int, ...]:
+    ids: list[int] = []
     for part in raw.replace(";", ",").split(","):
         part = part.strip()
         if not part:
             continue
         try:
-            ids.add(int(part))
+            admin_id = int(part)
         except ValueError as exc:
             raise ConfigError(f"ADMIN_IDS: некорректный Telegram ID «{part}»") from exc
-    return frozenset(ids)
+        if admin_id not in ids:
+            ids.append(admin_id)
+    return tuple(ids)
 
 
 def load_config(env_file: str | os.PathLike | None = None) -> Config:

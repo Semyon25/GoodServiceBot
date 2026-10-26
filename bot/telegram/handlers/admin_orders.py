@@ -72,7 +72,7 @@ async def _panel(actor: Actor, services: Services) -> tuple[str, object]:
     shift_title = t.fmt_date(date.fromisoformat(f["date"])) if f["date"] else "все даты"
     text = (
         "<b>📋 Заказы</b>\n"
-        f"Смена: {shift_title}\n"
+        f"Вынос: {shift_title}\n"
         f"Статус: {status_title}\n"
         f"Адрес: {t.h(address_title)}\n"
         f"Исполнитель: {t.h(executor_title)}\n\n"
@@ -81,7 +81,7 @@ async def _panel(actor: Actor, services: Services) -> tuple[str, object]:
     markup = rows(
         [
             ("◀️ День", AFilterCb(field="date", value="prev").pack()),
-            ("Текущая смена", AFilterCb(field="date", value="cur").pack()),
+            ("Текущий вынос", AFilterCb(field="date", value="cur").pack()),
             ("День ▶️", AFilterCb(field="date", value="next").pack()),
         ],
         [("📅 Все даты", AFilterCb(field="date", value="all").pack())],
@@ -131,7 +131,7 @@ async def change_filter(callback: CallbackQuery, callback_data: AFilterCb, actor
                 ("Без исполнителя", AFilterCb(field="executor", value="-1").pack()),
             ]
             buttons += [(u.display, AFilterCb(field="executor", value=str(u.id)).pack())
-                        for u in await services.users.list_executors(active_only=False)]
+                        for u in await services.orders.assignees()]
         await respond(callback, "Выберите значение фильтра:", build(buttons + [back], width=2))
         return
 
@@ -189,13 +189,13 @@ async def _card_text(order, services: Services) -> str:
 async def order_view(callback: CallbackQuery, callback_data: AOrderCb, actor: Actor, services: Services) -> None:
     order = await services.orders.get_for_admin(actor, callback_data.order_id)
     await callback.answer()
-    await respond(callback, await _card_text(order, services), admin_order_kb(order))
+    await respond(callback, await _card_text(order, services), admin_order_kb(order, viewer_id=actor.user.id))
 
 
 @router.callback_query(AOrderCb.filter(F.action == "assign"))
 async def order_assign(callback: CallbackQuery, callback_data: AOrderCb, actor: Actor, services: Services) -> None:
     order = await services.orders.get_for_admin(actor, callback_data.order_id)
-    executors = [e for e in await services.users.list_executors() if e.id != order.executor_id]
+    executors = [e for e in await services.orders.assignees() if e.id != order.executor_id]
     await callback.answer()
     if not executors:
         await respond(
@@ -204,7 +204,8 @@ async def order_assign(callback: CallbackQuery, callback_data: AOrderCb, actor: 
             rows([("◀️ К заявке", AOrderCb(action="view", order_id=order.id).pack())]),
         )
         return
-    buttons = [(e.display, AOrderCb(action="assign_to", order_id=order.id, arg=e.id).pack()) for e in executors]
+    buttons = [(("👑 " if e.tg_id in services.users.admin_ids else "") + e.display,
+                AOrderCb(action="assign_to", order_id=order.id, arg=e.id).pack()) for e in executors]
     buttons.append(("◀️ К заявке", AOrderCb(action="view", order_id=order.id).pack()))
     await respond(callback, f"Заявка №{order.id}. Выберите исполнителя:", build(buttons))
 
@@ -215,7 +216,7 @@ async def order_assign_to(callback: CallbackQuery, callback_data: AOrderCb, acto
     change = await services.orders.assign(actor, callback_data.order_id, callback_data.arg)
     await callback.answer("Исполнитель назначен")
     await respond(callback, "👷 Исполнитель назначен.\n\n" + await _card_text(change.order, services),
-                  admin_order_kb(change.order))
+                  admin_order_kb(change.order, viewer_id=actor.user.id))
     await notifier.order_assigned(change)
 
 
@@ -233,7 +234,7 @@ async def order_cancel_input(message: Message, data: dict, actor: Actor, service
                              notifier: Notifier) -> None:
     change = await services.orders.cancel(actor, int(data["order_id"]), message.text)
     await message.answer("❌ Заявка отменена.\n\n" + await _card_text(change.order, services),
-                         reply_markup=admin_order_kb(change.order))
+                         reply_markup=admin_order_kb(change.order, viewer_id=actor.user.id))
     await notifier.order_cancelled(change)
 
 
@@ -256,6 +257,6 @@ async def order_exception(callback: CallbackQuery, callback_data: AOrderCb, acto
     await callback.answer("Повторный заказ разрешён", show_alert=True)
     await notifier.to_user(
         order.user_id,
-        f"Администратор разрешил оформить ещё одну заявку в смену {t.fmt_date(order.shift_date)}. "
+        "Администратор разрешил оформить ещё одну заявку на вынос мусора. "
         "Нажмите «🗑 Заказать вынос мусора», когда пакет будет у двери.",
     )

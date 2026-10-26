@@ -16,6 +16,7 @@ def require_active(actor: Actor) -> None:
 
 
 def require_executor(actor: Actor) -> None:
+    """Исполнитель — пользователь с ролью исполнителя или администратор (администратор всегда исполнитель)."""
     require_active(actor)
-    if not actor.user.is_executor:
+    if not actor.user.is_executor and not actor.is_admin:
         raise AccessDenied("Действие доступно только исполнителям.")

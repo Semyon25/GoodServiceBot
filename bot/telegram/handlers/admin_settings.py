@@ -11,7 +11,7 @@ from bot.domain.errors import ValidationError
 from bot.domain.models import Actor
 from bot.services import Services
 from bot.services.reports import PERIODS
-from bot.services.settings import PAYMENT_KEYS, TEXT_KEYS
+from bot.services.settings import PAYMENT_KEYS, TEXT_KEYS, TEXT_PLACEHOLDERS
 
 from .. import texts as t
 from ..callbacks import AAddrCb, AExportCb, ASchedCb, ASettingCb, AStatsCb, ATariffCb, SupportCb
@@ -135,23 +135,24 @@ async def tariff_new_input(message: Message, data: dict, actor: Actor, services:
 # ============================================================= расписание
 
 TIME_KEYS = {
-    "accept_start": "Начало приёма заявок",
-    "accept_end": "Окончание приёма заявок",
-    "work_end": "Окончание выполнения",
+    "pickup_start": "Начало выноса",
+    "pickup_end": "Окончание выноса",
+    "order_cutoff": "Заявки на текущий вынос до",
 }
 
 
 async def _schedule_view(services: Services) -> tuple[str, object]:
     cfg = await services.settings.schedule()
-    text = "<b>🕒 Расписание</b>\n" + t.schedule_text(cfg) + (
-        "\n\nВремя окончания, меньшее времени начала, относится к следующим суткам. "
-        "Интервал после полуночи относится к смене предыдущего дня."
+    text = "<b>🕒 Расписание выноса</b>\n" + t.schedule_text(cfg) + (
+        "\n\nКнопки дней — дни, в которые забирается мусор. Время окончания, меньшее времени начала, "
+        "относится к следующим суткам: вынос 19:00–02:00 в пятницу заканчивается в субботу в 02:00.\n"
+        "Новое расписание сразу отображается во всех текстах бота."
     )
     day_buttons = [
         (("✅ " if d in cfg.work_days else "▫️ ") + WEEKDAY_SHORT[d], ASchedCb(action="day", value=str(d)).pack())
         for d in range(7)
     ]
-    current = {"accept_start": cfg.accept_start, "accept_end": cfg.accept_end, "work_end": cfg.work_end}
+    current = {"pickup_start": cfg.pickup_start, "pickup_end": cfg.pickup_end, "order_cutoff": cfg.order_cutoff}
     markup = rows(
         day_buttons[:4],
         day_buttons[4:],
@@ -306,6 +307,11 @@ async def sbp_panel(message: Message, state: FSMContext, services: Services) -> 
 # ============================================================== настройки
 
 EDITABLE_KEYS = {**PAYMENT_KEYS, **TEXT_KEYS}
+PLACEHOLDERS_HINT = (
+    "Чтобы в тексте всегда было актуальное расписание, используйте подстановки:\n"
+    + "\n".join(f"<code>{key}</code> — {t.h(title)}" for key, title in TEXT_PLACEHOLDERS.items())
+    + "\n\n"
+)
 
 
 async def _settings_view(services: Services) -> tuple[str, object]:
@@ -369,7 +375,9 @@ async def settings_edit(callback: CallbackQuery, callback_data: ASettingCb, stat
     await callback.answer()
     await ask_input(
         callback.message, state, "setting_text",
-        f"<b>{EDITABLE_KEYS[callback_data.key]}</b>\nТекущее значение:\n{t.h(current)}\n\nВведите новое значение:",
+        f"<b>{EDITABLE_KEYS[callback_data.key]}</b>\nТекущее значение:\n{t.h(current)}\n\n"
+        + (PLACEHOLDERS_HINT if callback_data.key in TEXT_KEYS else "")
+        + "Введите новое значение:",
         key=callback_data.key,
     )
 

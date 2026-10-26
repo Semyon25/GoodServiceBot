@@ -9,11 +9,26 @@ from bot.db.repositories import Repositories
 from bot.domain.enums import DistributionMode
 from bot.domain.errors import ValidationError
 from bot.domain.models import Actor, Service
-from bot.domain.schedule import ScheduleConfig, format_hhmm, parse_hhmm, validate_schedule
+from bot.domain.schedule import (
+    ALL_DAYS,
+    ScheduleConfig,
+    format_hhmm,
+    parse_hhmm,
+    pickup_days_text,
+    pickup_time_text,
+    validate_schedule,
+)
 
 from .access import require_admin
 
-SCHEDULE_KEYS = ("work_days", "accept_start", "accept_end", "work_end")
+SCHEDULE_KEYS = ("work_days", "pickup_start", "pickup_end", "order_cutoff")
+SCHEDULE_TIME_KEYS = ("pickup_start", "pickup_end", "order_cutoff")
+
+# Подстановки в текстах, которые редактирует администратор: всегда отражают текущее расписание
+TEXT_PLACEHOLDERS = {
+    "{дни}": "дни выноса, например «ежедневно» или «по будням»",
+    "{время}": "время выноса, например «с 19:00 до 02:00»",
+}
 
 PAYMENT_KEYS = {
     "payment.sbp_phone": "Номер телефона получателя",
@@ -26,6 +41,10 @@ TEXT_KEYS = {
     "texts.welcome": "Приветствие (/start)",
     "texts.help": "Текст раздела «Помощь»",
 }
+
+
+def render_text(template: str, cfg: ScheduleConfig) -> str:
+    return template.replace("{дни}", pickup_days_text(cfg)).replace("{время}", pickup_time_text(cfg))
 
 
 class Clock:
@@ -73,7 +92,7 @@ class SettingsService:
 
     async def set_schedule_time(self, actor: Actor, key: str, raw: str) -> None:
         require_admin(actor)
-        if key not in ("accept_start", "accept_end", "work_end"):
+        if key not in SCHEDULE_TIME_KEYS:
             raise ValidationError("Неизвестный параметр расписания.")
         try:
             value = format_hhmm(parse_hhmm(raw))
@@ -87,7 +106,7 @@ class SettingsService:
     async def toggle_work_day(self, actor: Actor, weekday: int) -> None:
         require_admin(actor)
         data = await self.schedule_data()
-        days = set(int(d) for d in data.get("work_days", []))
+        days = set(int(d) for d in data.get("work_days", ALL_DAYS))
         days ^= {weekday}
         data["work_days"] = sorted(days)
         self._validate(data)
@@ -98,6 +117,10 @@ class SettingsService:
             validate_schedule(ScheduleConfig.from_settings(data, self.tz))
         except ValueError as exc:
             raise ValidationError(str(exc)) from None
+
+    async def text(self, key: str) -> str:
+        """Текст из настроек с подставленным текущим расписанием."""
+        return render_text(str(await self.get(key, "")), await self.schedule())
 
     # --- распределение заявок ---
 

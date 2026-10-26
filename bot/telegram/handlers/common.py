@@ -35,7 +35,7 @@ async def cmd_start(message: Message, state: FSMContext, actor: Actor, services:
     if actor.user.is_executor:
         await message.answer("Меню исполнителя. Выберите список заявок.", reply_markup=menu_for(actor))
         return
-    welcome = await services.settings.get("texts.welcome", "")
+    welcome = await services.settings.text("texts.welcome")
     address = await services.addresses.current(actor.user.id)
     text = t.h(welcome)
     if not address:

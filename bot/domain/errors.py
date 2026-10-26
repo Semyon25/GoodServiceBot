@@ -46,7 +46,7 @@ class OutsideSchedule(DomainError):
 
 
 class AlreadyOrdered(DomainError):
-    def __init__(self, order: Any, message: str = "Заявка на текущую смену уже создана."):
+    def __init__(self, order: Any, message: str = "Вы уже заказали вынос мусора — повторно заказывать не нужно."):
         super().__init__(message)
         self.order = order
 

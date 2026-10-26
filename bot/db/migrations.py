@@ -19,40 +19,44 @@ log = logging.getLogger(__name__)
 NOW_SQL = "strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')"
 
 
+# Начальные настройки версии 1 (не менять: на них ссылается миграция 2)
+SETTINGS_V1 = {
+    "schedule.work_days": [0, 1, 2, 3, 4],
+    "schedule.accept_start": "19:00",
+    "schedule.accept_end": "01:00",
+    "schedule.work_end": "02:00",
+    "payment.sbp_phone": "+7 900 000-00-00",
+    "payment.sbp_bank": "Укажите банк получателя",
+    "payment.sbp_recipient": "Укажите имя получателя",
+    "payment.instructions": (
+        "Откройте приложение своего банка, выберите перевод по номеру телефона (СБП), "
+        "укажите номер и банк получателя и переведите точную сумму. "
+        "После перевода нажмите «Я оплатил» и пришлите чек или скриншот операции."
+    ),
+    "orders.distribution_mode": "manual",
+    "orders.unassigned_alert_minutes": 15,
+    "texts.welcome": (
+        "Здравствуйте! Это сервис выноса бытового мусора в ЖК «Заречье Парк».\n\n"
+        "Оформите подписку, выставьте пакет у двери квартиры и нажмите кнопку — "
+        "исполнитель заберёт его в рабочую смену (по будням с 19:00 до 02:00)."
+    ),
+    "texts.help": (
+        "Как это работает:\n"
+        "1. Укажите адрес в разделе «Мой адрес».\n"
+        "2. Выберите тариф в разделе «Тарифы и оплата» и оплатите его переводом через СБП.\n"
+        "3. После подтверждения оплаты администратором подписка станет активной.\n"
+        "4. В рабочую смену выставьте пакет у двери и нажмите «Заказать вынос мусора».\n\n"
+        "Одна заявка — одна смена. Заявки принимаются по будням с 19:00 до 01:00."
+    ),
+}
+
+
+def _sql_str(value) -> str:
+    return "'" + json.dumps(value, ensure_ascii=False).replace("'", "''") + "'"
+
+
 def _seed_settings() -> str:
-    settings = {
-        "schedule.work_days": [0, 1, 2, 3, 4],
-        "schedule.accept_start": "19:00",
-        "schedule.accept_end": "01:00",
-        "schedule.work_end": "02:00",
-        "payment.sbp_phone": "+7 900 000-00-00",
-        "payment.sbp_bank": "Укажите банк получателя",
-        "payment.sbp_recipient": "Укажите имя получателя",
-        "payment.instructions": (
-            "Откройте приложение своего банка, выберите перевод по номеру телефона (СБП), "
-            "укажите номер и банк получателя и переведите точную сумму. "
-            "После перевода нажмите «Я оплатил» и пришлите чек или скриншот операции."
-        ),
-        "orders.distribution_mode": "manual",
-        "orders.unassigned_alert_minutes": 15,
-        "texts.welcome": (
-            "Здравствуйте! Это сервис выноса бытового мусора в ЖК «Заречье Парк».\n\n"
-            "Оформите подписку, выставьте пакет у двери квартиры и нажмите кнопку — "
-            "исполнитель заберёт его в рабочую смену (по будням с 19:00 до 02:00)."
-        ),
-        "texts.help": (
-            "Как это работает:\n"
-            "1. Укажите адрес в разделе «Мой адрес».\n"
-            "2. Выберите тариф в разделе «Тарифы и оплата» и оплатите его переводом через СБП.\n"
-            "3. После подтверждения оплаты администратором подписка станет активной.\n"
-            "4. В рабочую смену выставьте пакет у двери и нажмите «Заказать вынос мусора».\n\n"
-            "Одна заявка — одна смена. Заявки принимаются по будням с 19:00 до 01:00."
-        ),
-    }
-    rows = ",\n".join(
-        f"('{key}', '{json.dumps(value, ensure_ascii=False).replace(chr(39), chr(39) * 2)}', {NOW_SQL})"
-        for key, value in settings.items()
-    )
+    rows = ",\n".join(f"('{key}', {_sql_str(value)}, {NOW_SQL})" for key, value in SETTINGS_V1.items())
     return f"INSERT INTO system_settings (key, value, updated_at) VALUES\n{rows};"
 
 
@@ -302,9 +306,61 @@ INSERT INTO tariffs (service_id, title, price_rub, duration_days, sort_order) VA
 {_seed_settings()}
 """
 
+
+NEW_WELCOME = (
+    "Это сервис выноса бытового мусора в ЖК «Заречье Парк».\n\n"
+    "Оформите подписку, выставьте пакет у двери квартиры и нажмите кнопку — "
+    "исполнитель заберёт его {дни} {время}."
+)
+
+NEW_HELP = (
+    "Как это работает:\n"
+    "1. Укажите адрес в разделе «Мой адрес».\n"
+    "2. Выберите тариф в разделе «Тарифы и оплата» и оплатите его переводом через СБП.\n"
+    "3. После подтверждения оплаты администратором подписка станет активной.\n"
+    "4. Выставьте пакет у двери и нажмите «Заказать вынос мусора» — заказать можно в любое время.\n\n"
+    "Мусор забираем {дни} {время}."
+)
+
+
+def _migration_2() -> str:
+    """Цены 299/999 ₽; заказ в любое время, вынос ежедневно 19:00–02:00; тексты с подстановкой расписания."""
+    trash = "(SELECT id FROM services WHERE code = 'trash')"
+
+    def rename(old: str, new: str) -> str:
+        return (
+            "INSERT INTO system_settings (key, value, updated_at, updated_by_tg) "
+            f"SELECT 'schedule.{new}', value, updated_at, updated_by_tg FROM system_settings "
+            f"WHERE key = 'schedule.{old}';\n"
+            f"DELETE FROM system_settings WHERE key = 'schedule.{old}';"
+        )
+
+    def replace_default(key: str, new_value: str) -> str:
+        # меняем текст, только если администратор его не редактировал
+        return (
+            f"UPDATE system_settings SET value = {_sql_str(new_value)}, updated_at = {NOW_SQL} "
+            f"WHERE key = '{key}' AND value = {_sql_str(SETTINGS_V1[key])};"
+        )
+
+    return "\n".join(
+        [
+            f"UPDATE tariffs SET price_rub = 299 WHERE service_id = {trash} AND title = 'Неделя';",
+            f"UPDATE tariffs SET price_rub = 999 WHERE service_id = {trash} AND title = 'Месяц';",
+            rename("accept_start", "pickup_start"),
+            rename("work_end", "pickup_end"),
+            rename("accept_end", "order_cutoff"),
+            f"UPDATE system_settings SET value = '[0, 1, 2, 3, 4, 5, 6]', updated_at = {NOW_SQL} "
+            "WHERE key = 'schedule.work_days';",
+            replace_default("texts.welcome", NEW_WELCOME),
+            replace_default("texts.help", NEW_HELP),
+        ]
+    )
+
+
 # (версия, SQL). Новые миграции добавляются в конец списка.
 MIGRATIONS: list[tuple[int, str]] = [
     (1, MIGRATION_1),
+    (2, _migration_2()),
 ]
 
 

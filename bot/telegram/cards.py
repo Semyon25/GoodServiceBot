@@ -17,31 +17,37 @@ from .callbacks import AOrderCb, APayCb, AUserCb, ExecCb, OrderCb
 from .keyboards import rows
 
 
-def executor_order_kb(order: Order, back_view: str = "") -> InlineKeyboardMarkup:
+def executor_actions(order: Order) -> list[list[tuple[str, str]]]:
     buttons = []
     if order.status in (O.NEW, O.ASSIGNED):
         buttons.append([("✋ Принять", ExecCb(action="accept", order_id=order.id).pack())])
     if order.status == O.ACCEPTED:
         buttons.append([("▶️ Начать выполнение", ExecCb(action="start", order_id=order.id).pack())])
-    if order.status in (O.ACCEPTED, O.IN_PROGRESS):
-        buttons.append([("✅ Выполнено", ExecCb(action="done", order_id=order.id).pack())])
     if order.status in (O.ASSIGNED, O.ACCEPTED, O.IN_PROGRESS):
+        buttons.append([("✅ Выполнено", ExecCb(action="done", order_id=order.id).pack())])
         buttons.append([("⚠️ Не удалось выполнить", ExecCb(action="fail", order_id=order.id).pack())])
+    return buttons
+
+
+def executor_order_kb(order: Order, back_view: str = "") -> InlineKeyboardMarkup:
+    buttons = executor_actions(order)
     buttons.append([("🔄 Обновить", ExecCb(action="view", order_id=order.id, view=back_view).pack())])
     if back_view:
         buttons.append([("◀️ К списку", ExecCb(action="list", view=back_view).pack())])
     return rows(*buttons)
 
 
-def admin_order_kb(order: Order, back: bool = True) -> InlineKeyboardMarkup:
-    buttons = []
+def admin_order_kb(order: Order, back: bool = True, viewer_id: int | None = None) -> InlineKeyboardMarkup:
+    """viewer_id — пользователь-администратор, который смотрит карточку: если заявка на нём,
+    добавляются кнопки исполнителя."""
+    buttons = executor_actions(order) if viewer_id and order.executor_id == viewer_id else []
     if order_transition_allowed(order.status, O.ASSIGNED):
         label = "👷 Переназначить" if order.executor_id else "👷 Назначить исполнителя"
         buttons.append([(label, AOrderCb(action="assign", order_id=order.id).pack())])
     if order.status in ORDER_ACTIVE_STATUSES:
         buttons.append([("❌ Отменить заявку", AOrderCb(action="cancel", order_id=order.id).pack())])
     if order.status in ORDER_FINAL_STATUSES:
-        buttons.append([("♻️ Разрешить повторный заказ в смену", AOrderCb(action="exception", order_id=order.id).pack())])
+        buttons.append([("♻️ Разрешить повторный заказ", AOrderCb(action="exception", order_id=order.id).pack())])
     buttons.append(
         [
             ("📜 История", AOrderCb(action="history", order_id=order.id).pack()),

@@ -43,6 +43,7 @@ def executor_menu() -> ReplyKeyboardMarkup:
 def admin_menu() -> ReplyKeyboardMarkup:
     return _reply(
         [
+            [t.BTN_A_MY_ORDERS],
             [t.BTN_A_ORDERS, t.BTN_A_PAYMENTS],
             [t.BTN_A_USERS, t.BTN_A_TARIFFS],
             [t.BTN_A_SCHEDULE, t.BTN_A_ADDRESSES],

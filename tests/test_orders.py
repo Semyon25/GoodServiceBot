@@ -11,7 +11,6 @@ from bot.domain.errors import (
     NoAddress,
     NoSubscription,
     NotFound,
-    OutsideSchedule,
     UserBlocked,
     ValidationError,
 )
@@ -43,7 +42,9 @@ async def test_order_created_with_address_snapshot(env):
     client = await _ready_client(env)
     service = await env.service()
     order = await env.services.orders.create_order(client, service)
-    assert order.status == OrderStatus.NEW
+    # по умолчанию заявка сразу назначается администратору
+    admin = await env.admin()
+    assert order.status == OrderStatus.ASSIGNED and order.executor_id == admin.user.id
     assert str(order.shift_date) == "2026-10-21"
     assert (order.address_title, order.section, order.floor, order.apartment, order.intercom_code) == (
         "Торговая, 6", 3, 5, "45", "45K1234",
@@ -56,19 +57,19 @@ async def test_order_created_with_address_snapshot(env):
 
 
 @pytest.mark.parametrize(
-    "moment",
+    "moment, shift_date",
     [
-        (2026, 10, 22, 18, 0),  # будний день до начала приёма
-        (2026, 10, 22, 1, 30),  # приём закрыт, идёт выполнение
-        (2026, 10, 24, 20, 0),  # суббота
-        (2026, 10, 25, 21, 0),  # воскресенье
+        ((2026, 10, 22, 10, 0), "2026-10-22"),  # днём — на вечерний вынос
+        ((2026, 10, 22, 1, 30), "2026-10-22"),  # ночью после 01:00 — на следующий вынос
+        ((2026, 10, 24, 20, 0), "2026-10-24"),  # суббота
+        ((2026, 10, 25, 21, 0), "2026-10-25"),  # воскресенье
     ],
 )
-async def test_order_outside_schedule(env, moment):
+async def test_order_any_time(env, moment, shift_date):
     client = await _ready_client(env)
     env.clock.set(*moment)
-    with pytest.raises(OutsideSchedule):
-        await env.services.orders.create_order(client, await env.service())
+    order = await env.services.orders.create_order(client, await env.service())
+    assert str(order.shift_date) == shift_date
 
 
 async def test_after_midnight_belongs_to_previous_shift(env):
@@ -82,11 +83,11 @@ async def test_one_order_per_shift(env):
     client = await _ready_client(env)
     service = await env.service()
     first = await env.services.orders.create_order(client, service)
-    env.clock.set(2026, 10, 22, 0, 30)  # та же смена после полуночи
+    env.clock.set(2026, 10, 22, 0, 30)  # тот же вынос после полуночи
     with pytest.raises(AlreadyOrdered) as exc:
         await env.services.orders.create_order(client, service)
     assert exc.value.order.id == first.id
-    env.clock.set(2026, 10, 22, 19, 30)  # следующая смена — можно
+    env.clock.set(2026, 10, 22, 19, 30)  # следующий вынос — можно
     second = await env.services.orders.create_order(client, service)
     assert str(second.shift_date) == "2026-10-22"
 
@@ -144,20 +145,19 @@ async def test_manual_mode_full_flow(env):
     other_executor = await env.actor(501, Role.EXECUTOR, "worker2")
     order = await env.services.orders.create_order(client, await env.service())
 
-    # в ручном режиме неназначенная заявка исполнителю не видна
+    # заявка на администраторе — исполнителю она не видна
     assert await env.services.orders.executor_orders(executor, "new") == []
     with pytest.raises(NotFound):
         await env.services.orders.executor_accept(executor, order.id)
 
     change = await env.services.orders.assign(admin, order.id, executor.user.id)
-    assert change.order.status == OrderStatus.ASSIGNED and change.previous_executor_id is None
+    assert change.order.status == OrderStatus.ASSIGNED and change.previous_executor_id == admin.user.id
     assert [o.id for o in await env.services.orders.executor_orders(executor, "assigned")] == [order.id]
     with pytest.raises(NotFound):
         await env.services.orders.get_for_executor(other_executor, order.id)
-
-    # нельзя завершить, не приняв
-    with pytest.raises(InvalidTransition):
-        await env.services.orders.executor_done(executor, order.id)
+    # администратор больше не исполнитель этой заявки
+    with pytest.raises(AccessDenied):
+        await env.services.orders.executor_done(admin, order.id)
 
     await env.services.orders.executor_accept(executor, order.id)
     await env.services.orders.executor_start(executor, order.id)
@@ -173,8 +173,8 @@ async def test_manual_mode_full_flow(env):
 
     history = [(h.old_status, h.new_status) for h in await env.services.orders.history(admin, order.id)]
     assert history == [
-        (None, "new"), ("new", "assigned"), ("assigned", "accepted"), ("accepted", "in_progress"),
-        ("in_progress", "done"),
+        (None, "new"), ("new", "assigned"), ("assigned", "assigned"), ("assigned", "accepted"),
+        ("accepted", "in_progress"), ("in_progress", "done"),
     ]
     assert [o.id for o in await env.services.orders.executor_orders(executor, "done_shift")] == [order.id]
 
@@ -246,7 +246,32 @@ async def test_access_rights(env):
         await env.services.settings.set(executor, "orders.distribution_mode", "pool")
 
 
+async def test_admin_is_default_executor(env):
+    client = await _ready_client(env)
+    admin = await env.admin()
+    executor = await env.actor(500, Role.EXECUTOR)
+    order = await env.services.orders.create_order(client, await env.service())
+    assert [o.id for o in await env.services.orders.executor_orders(admin, "assigned")] == [order.id]
+    assert {u.id for u in await env.services.orders.assignees()} == {admin.user.id, executor.user.id}
+    # «Выполнено» сразу из назначенной заявки
+    done = await env.services.orders.executor_done(admin, order.id)
+    assert done.status == OrderStatus.DONE and done.executor_id == admin.user.id
+    history = [(h.old_status, h.new_status) for h in await env.services.orders.history(admin, order.id)]
+    assert history[-2:] == [("assigned", "accepted"), ("accepted", "done")]
+
+
+async def test_admin_can_take_back_order(env):
+    client = await _ready_client(env)
+    admin = await env.admin()
+    executor = await env.actor(500, Role.EXECUTOR)
+    order = await env.services.orders.create_order(client, await env.service())
+    await env.services.orders.assign(admin, order.id, executor.user.id)
+    change = await env.services.orders.assign(admin, order.id, admin.user.id)
+    assert change.order.executor_id == admin.user.id and change.previous_executor_id == executor.user.id
+
+
 async def test_unassigned_alert_once(env):
+    await _set_mode(env, DistributionMode.POOL)
     client = await _ready_client(env)
     order = await env.services.orders.create_order(client, await env.service())
     assert await env.services.orders.mark_unassigned_alerts() == []

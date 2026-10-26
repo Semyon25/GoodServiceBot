@@ -94,7 +94,7 @@ FAIL_REASON_TITLES = {
 }
 
 DISTRIBUTION_MODE_TITLES = {
-    DistributionMode.MANUAL: "Назначает администратор",
+    DistributionMode.MANUAL: "Все заявки — администратору, он распределяет",
     DistributionMode.POOL: "Общий пул (первый принявший)",
 }
 

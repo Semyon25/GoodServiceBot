@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import html
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from bot.domain.enums import (
@@ -19,7 +19,8 @@ from bot.domain.enums import (
     UserStatus,
 )
 from bot.domain.models import Order, Payment, StatusHistoryEntry, Subscription, User, UserAddress
-from bot.domain.schedule import ScheduleConfig
+from bot.domain.schedule import ScheduleConfig, pickup_days_text, pickup_time_text, pickup_when_text
+from bot.domain.transitions import ORDER_ACTIVE_STATUSES
 
 # --- кнопки главного меню клиента ---
 BTN_ORDER = "🗑 Заказать вынос мусора"
@@ -36,6 +37,7 @@ BTN_EX_ASSIGNED = "📌 Назначенные"
 BTN_EX_IN_WORK = "🚶 В работе"
 BTN_EX_DONE = "✅ Выполненные за смену"
 BTN_EX_HISTORY = "🗂 История заказов"
+BTN_A_MY_ORDERS = "🧹 Мои заявки"
 
 # --- администратор ---
 BTN_A_ORDERS = "📋 Заказы"
@@ -53,7 +55,7 @@ BTN_A_CLIENT_MODE = "👤 Режим клиента"
 ALL_MENU_BUTTONS = frozenset(
     {
         BTN_ORDER, BTN_SUBSCRIPTION, BTN_ADDRESS, BTN_TARIFFS, BTN_MY_ORDERS, BTN_HELP, BTN_ADMIN_PANEL,
-        BTN_EX_NEW, BTN_EX_ASSIGNED, BTN_EX_IN_WORK, BTN_EX_DONE, BTN_EX_HISTORY,
+        BTN_EX_NEW, BTN_EX_ASSIGNED, BTN_EX_IN_WORK, BTN_EX_DONE, BTN_EX_HISTORY, BTN_A_MY_ORDERS,
         BTN_A_ORDERS, BTN_A_PAYMENTS, BTN_A_USERS, BTN_A_TARIFFS, BTN_A_SCHEDULE, BTN_A_ADDRESSES,
         BTN_A_SBP, BTN_A_SETTINGS, BTN_A_STATS, BTN_A_EXPORT, BTN_A_CLIENT_MODE,
     }
@@ -79,8 +81,32 @@ def fmt_date(value: date | None) -> str:
     return f"{value:%d.%m.%Y} ({WEEKDAY_SHORT[value.weekday()]})"
 
 
+def fmt_day(value: date | datetime | None, tz: ZoneInfo | None = None) -> str:
+    if value is None:
+        return "—"
+    if isinstance(value, datetime):
+        value = value.astimezone(tz).date()
+    return value.strftime("%d.%m.%Y")
+
+
 def order_status(order: Order) -> str:
     return ORDER_STATUS_TITLES[OrderStatus(order.status)]
+
+
+# Клиенту не важны внутренние этапы («Назначен», «Принят», «В работе»)
+CLIENT_STATUS_TITLES = {
+    OrderStatus.NEW: "Ожидает выноса",
+    OrderStatus.ASSIGNED: "Ожидает выноса",
+    OrderStatus.ACCEPTED: "Ожидает выноса",
+    OrderStatus.IN_PROGRESS: "Ожидает выноса",
+    OrderStatus.DONE: "Мусор вынесен",
+    OrderStatus.FAILED: "Не удалось вынести",
+    OrderStatus.CANCELLED: "Отменена",
+}
+
+
+def client_status(order: Order) -> str:
+    return CLIENT_STATUS_TITLES[OrderStatus(order.status)]
 
 
 def payment_status(payment: Payment) -> str:
@@ -104,8 +130,9 @@ def address_text(ua: UserAddress) -> str:
     return "\n".join(lines)
 
 
-def order_short(order: Order) -> str:
-    return f"№{order.id} · {order.address_title}, с{order.section}, кв {order.apartment} · {order_status(order)}"
+def order_short(order: Order, numbered: bool = True) -> str:
+    prefix = f"№{order.id}" if numbered else f"{order.shift_date:%d.%m}"
+    return f"{prefix} · {order.address_title}, с{order.section}, кв {order.apartment} · {order_status(order)}"
 
 
 def fail_text(order: Order) -> str | None:
@@ -123,10 +150,12 @@ def order_card(
     executor: User | None = None,
     client: User | None = None,
     title: str | None = None,
+    numbered: bool = True,
 ) -> str:
-    lines = [title or f"<b>Заявка №{order.id}</b>"]
+    """Карточка заявки для исполнителя и администратора."""
+    lines = [title or (f"<b>Заявка №{order.id}</b>" if numbered else "<b>Заявка на вынос</b>")]
     lines.append(f"Статус: <b>{order_status(order)}</b>")
-    lines.append(f"Смена: {fmt_date(order.shift_date)}")
+    lines.append(f"Вынос: {fmt_date(order.shift_date)}")
     lines.append(f"Создана: {fmt_dt(order.created_at, tz)}")
     lines.append(f"Адрес: <b>{h(order.address_title)}</b>, секция {order.section}")
     lines.append(f"Этаж: {order.floor}, квартира: {h(order.apartment)}")
@@ -142,6 +171,21 @@ def order_card(
         lines.append(f"Начато: {fmt_dt(order.started_at, tz)}")
     if order.finished_at:
         lines.append(f"Завершено: {fmt_dt(order.finished_at, tz)}")
+    reason = fail_text(order)
+    if reason:
+        lines.append(f"Причина: {h(reason)}")
+    if order.cancel_reason:
+        lines.append(f"Причина отмены: {h(order.cancel_reason)}")
+    return "\n".join(lines)
+
+
+def client_order_card(order: Order, cfg: ScheduleConfig, now: datetime, title: str | None = None) -> str:
+    """Карточка заявки для клиента: только статус и когда заберут / забрали."""
+    lines = [title or "<b>🗑 Вынос мусора</b>", f"Статус: <b>{client_status(order)}</b>"]
+    if order.status in ORDER_ACTIVE_STATUSES:
+        lines.append(f"Заберём: {pickup_when_text(order.shift_date, now, cfg)}")
+    elif order.status == OrderStatus.DONE and order.finished_at:
+        lines.append(f"Забрали: {order.finished_at.astimezone(cfg.tz):%d.%m.%Y в %H:%M}")
     reason = fail_text(order)
     if reason:
         lines.append(f"Причина: {h(reason)}")
@@ -180,11 +224,22 @@ def payment_short(payment: Payment, tz: ZoneInfo, client: User | None = None) ->
     return f"№{payment.id} · {payment.amount_rub} ₽{who} · {payment.created_at.astimezone(tz):%d.%m %H:%M}"
 
 
+def subscription_first_day(sub: Subscription, tz: ZoneInfo) -> str:
+    return fmt_day(sub.starts_at, tz)
+
+
+def subscription_last_day(sub: Subscription, tz: ZoneInfo) -> str:
+    """Последний день действия (включительно): подписка заканчивается в 00:00 следующего дня."""
+    return fmt_day(sub.ends_at - timedelta(seconds=1), tz)
+
+
+def subscription_period(sub: Subscription, tz: ZoneInfo) -> str:
+    return f"{subscription_first_day(sub, tz)} — {subscription_last_day(sub, tz)}"
+
+
 def subscription_line(sub: Subscription, tz: ZoneInfo, now: datetime) -> str:
     state = "действует" if sub.is_active_at(now) else ("начнётся" if sub.starts_at > now else "истекла")
-    return (
-        f"• {h(sub.tariff_title)}: {fmt_dt(sub.starts_at, tz)} — {fmt_dt(sub.ends_at, tz)} ({state})"
-    )
+    return f"• {h(sub.tariff_title)}: {subscription_period(sub, tz)} ({state})"
 
 
 def requisites_text(details: dict[str, str]) -> str:
@@ -198,22 +253,20 @@ def requisites_text(details: dict[str, str]) -> str:
 def payment_instructions(payment: Payment, details: dict[str, str]) -> str:
     return (
         f"<b>Оплата подписки «{h(payment.tariff_title)}»</b>\n"
-        f"Платёж №{payment.id}\n"
         f"Сумма к переводу: <b>{payment.amount_rub} ₽</b>\n"
-        f"Срок действия: {payment.duration_days} дн. с момента подтверждения оплаты\n\n"
+        f"Срок действия: {payment.duration_days} дн., начиная с дня подтверждения оплаты\n\n"
         f"{requisites_text(details)}\n\n"
         f"{h(details['payment.instructions'])}\n\n"
-        f"В комментарии к переводу можно указать: <code>Платёж {payment.id}</code>\n\n"
+        "В комментарии к переводу ничего указывать не нужно.\n\n"
         "После перевода нажмите «✅ Я оплатил» и пришлите чек или скриншот."
     )
 
 
 def schedule_text(cfg: ScheduleConfig) -> str:
-    days = ", ".join(WEEKDAY_SHORT[d] for d in sorted(cfg.work_days)) or "—"
     return (
-        f"Рабочие дни: {days}\n"
-        f"Приём заявок: {cfg.accept_start:%H:%M} — {cfg.accept_end:%H:%M}\n"
-        f"Окончание выполнения: {cfg.work_end:%H:%M}\n"
+        f"Вынос мусора: {pickup_days_text(cfg)} {pickup_time_text(cfg)}\n"
+        "Заказать вынос клиент может в любое время.\n"
+        f"Заявки, оформленные после {cfg.order_cutoff:%H:%M}, попадают в следующий вынос.\n"
         f"Часовой пояс: {cfg.tz.key}"
     )
 

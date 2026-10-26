@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 from bot.db.connection import IntegrityError
 from bot.db.repositories import Repositories
@@ -22,12 +23,33 @@ from bot.domain.transitions import payment_transition_allowed
 from .access import require_active, require_admin
 from .tariffs import CatalogService
 
-REMINDER_BEFORE = timedelta(days=1)
+# Подписка действует целыми календарными днями: с 00:00 дня подтверждения оплаты
+# до 00:00 дня, следующего за последним. Напоминание — днём (12:00) накануне последнего дня,
+# уведомление об окончании — утром (10:00) после последнего дня.
+REMINDER_BEFORE = timedelta(hours=36)
+EXPIRY_NOTICE_DELAY = timedelta(hours=10)
+
+
+def day_start(day: date, tz: ZoneInfo) -> datetime:
+    return datetime.combine(day, time(0), tzinfo=tz)
+
+
+def subscription_period(starts_at: datetime, duration_days: int, tz: ZoneInfo) -> tuple[datetime, datetime]:
+    first_day = starts_at.astimezone(tz).date()
+    return day_start(first_day, tz), day_start(first_day + timedelta(days=duration_days), tz)
+
+
+def last_day(sub: Subscription, tz: ZoneInfo) -> date:
+    """Последний день действия подписки (включительно)."""
+    return (sub.ends_at - timedelta(seconds=1)).astimezone(tz).date()
 
 
 class PaymentService:
-    def __init__(self, repos: Repositories, catalog: CatalogService, clock: Callable[[], datetime]):
+    def __init__(
+        self, repos: Repositories, catalog: CatalogService, clock: Callable[[], datetime], tz: ZoneInfo
+    ):
         self.repos = repos
+        self.tz = tz
         self.catalog = catalog
         self._now = clock
 
@@ -53,7 +75,7 @@ class PaymentService:
             if open_payment and open_payment.status == PaymentStatus.AWAITING_CONFIRMATION:
                 raise PaymentPending(
                     open_payment,
-                    f"Ваш платёж №{open_payment.id} на {open_payment.amount_rub} ₽ уже на проверке у администратора. "
+                    f"Ваша оплата на {open_payment.amount_rub} ₽ уже на проверке у администратора. "
                     "Дождитесь подтверждения — повторно оплачивать не нужно.",
                 )
             if open_payment:
@@ -96,7 +118,7 @@ class PaymentService:
             return payment, False
         if payment.status != PaymentStatus.AWAITING_PAYMENT:
             raise InvalidTransition(
-                f"Платёж №{payment.id} уже обработан (статус: {PAYMENT_STATUS_TITLES[payment.status_enum]})."
+                f"Эта оплата уже обработана (статус: {PAYMENT_STATUS_TITLES[payment.status_enum]})."
             )
         now = self._now()
         async with self.repos.transaction():
@@ -146,8 +168,9 @@ class PaymentService:
                 raise InternalStateError(f"Для платежа №{payment.id} уже существует подписка")
 
             latest_end = await self.repos.subscriptions.latest_end(payment.user_id, payment.service_id)
-            starts_at = max(now, latest_end) if latest_end else now
-            ends_at = starts_at + timedelta(days=payment.duration_days)
+            starts_at, ends_at = subscription_period(
+                max(now, latest_end) if latest_end else now, payment.duration_days, self.tz
+            )
             try:
                 subscription_id = await self.repos.subscriptions.create(
                     user_id=payment.user_id,
@@ -275,7 +298,7 @@ class SubscriptionService:
             user = await self.repos.users.get(sub.user_id)
             if user:
                 events.append(SubscriptionEvent("reminder", user, sub))
-        for sub in await self.repos.subscriptions.due_for_expiry(now):
+        for sub in await self.repos.subscriptions.due_for_expiry(now - EXPIRY_NOTICE_DELAY):
             has_successor = await self.repos.subscriptions.has_successor(sub)
             if not await self.repos.subscriptions.mark_expired(sub.id, notified=not has_successor):
                 continue

@@ -10,6 +10,18 @@ from bot.services import Services
 from .conftest import ADMIN_TG, MSK, FakeClock, msk
 
 
+async def test_migration_2_defaults(env):
+    settings = await env.repos.settings.get_all()
+    assert settings["schedule.work_days"] == [0, 1, 2, 3, 4, 5, 6]
+    assert (settings["schedule.pickup_start"], settings["schedule.pickup_end"], settings["schedule.order_cutoff"]) == (
+        "19:00", "02:00", "01:00",
+    )
+    assert "schedule.accept_start" not in settings
+    welcome = await env.services.settings.text("texts.welcome")
+    assert "Здравствуйте" not in welcome and "ежедневно с 19:00 до 02:00" in welcome
+    assert "{дни}" in settings["texts.help"]
+
+
 async def test_initial_addresses(env):
     addresses = {a.title: a.sections_count for a in await env.services.addresses.list_addresses()}
     assert addresses == {"Торговая, 6": 8, "Луговая, 6к1": 10, "Луговая, 3": 11}
@@ -60,13 +72,40 @@ async def test_admin_from_config_only(env):
 async def test_schedule_settings_validation(env):
     admin = await env.admin()
     with pytest.raises(ValidationError):
-        await env.services.settings.set_schedule_time(admin, "accept_end", "25:00")
+        await env.services.settings.set_schedule_time(admin, "order_cutoff", "25:00")
     with pytest.raises(ValidationError):
-        await env.services.settings.set_schedule_time(admin, "accept_end", "03:00")  # позже конца выполнения
-    await env.services.settings.set_schedule_time(admin, "accept_start", "18:00")
-    assert (await env.services.settings.schedule()).accept_start.hour == 18
+        await env.services.settings.set_schedule_time(admin, "order_cutoff", "03:00")  # позже конца выноса
+    await env.services.settings.set_schedule_time(admin, "pickup_start", "18:00")
+    assert (await env.services.settings.schedule()).pickup_start.hour == 18
     await env.services.settings.toggle_work_day(admin, 5)
-    assert 5 in (await env.services.settings.schedule()).work_days
+    assert 5 not in (await env.services.settings.schedule()).work_days
+    assert "18:00" in await env.services.settings.text("texts.help")
+
+
+async def test_upgrade_from_v1_keeps_data_and_admin_texts(tmp_path, monkeypatch):
+    """База, созданная прошлой версией бота, обновляется до текущей без потери данных."""
+    import bot.db.migrations as migrations
+
+    db = Database(tmp_path / "old.sqlite3")
+    await db.connect()
+    monkeypatch.setattr(migrations, "MIGRATIONS", MIGRATIONS[:1])
+    assert await migrations.migrate(db) == 1
+    await db.execute("UPDATE system_settings SET value = '\"Свой текст помощи\"' WHERE key = 'texts.help'")
+    await db.execute("UPDATE system_settings SET value = '\"20:00\"' WHERE key = 'schedule.accept_start'")
+    await db.execute(
+        "INSERT INTO users (tg_id, username, registered_at) VALUES (5, 'old', '2026-10-20T10:00:00+00:00')"
+    )
+
+    monkeypatch.setattr(migrations, "MIGRATIONS", MIGRATIONS)
+    assert await migrations.migrate(db) == MIGRATIONS[-1][0]
+    settings = await Repositories(db).settings.get_all()
+    assert settings["schedule.pickup_start"] == "20:00"  # настройка администратора перенесена
+    assert settings["texts.help"] == "Свой текст помощи"  # отредактированный текст не тронут
+    assert "Здравствуйте" not in settings["texts.welcome"]
+    prices = {r["title"]: r["price_rub"] for r in await db.fetchall("SELECT title, price_rub FROM tariffs")}
+    assert prices == {"Неделя": 299, "Месяц": 999}
+    assert await db.fetchval("SELECT username FROM users WHERE tg_id = 5") == "old"
+    await db.close()
 
 
 async def test_migrations_are_idempotent_and_data_persists(tmp_path):

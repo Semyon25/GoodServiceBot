@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Callable
+from typing import Callable, Iterable
 
 from bot.db.connection import IntegrityError
 from bot.db.repositories import Repositories
@@ -26,7 +26,7 @@ from bot.domain.errors import (
     ValidationError,
 )
 from bot.domain.models import Actor, Order, Service, StatusHistoryEntry, User
-from bot.domain.schedule import accepting_shift, current_shift, last_shift_date, next_shift
+from bot.domain.schedule import last_shift_date, order_shift
 from bot.domain.transitions import ORDER_ACTIVE_STATUSES, ORDER_FINAL_STATUSES, order_transition_allowed
 
 from .access import require_active, require_admin, require_executor
@@ -34,8 +34,6 @@ from .settings import SettingsService
 from .tariffs import CatalogService
 
 O = OrderStatus
-
-WEEKDAYS_GENITIVE = ["понедельник", "вторник", "среду", "четверг", "пятницу", "субботу", "воскресенье"]
 
 
 @dataclass
@@ -61,71 +59,49 @@ class OrderService:
         settings: SettingsService,
         catalog: CatalogService,
         clock: Callable[[], datetime],
+        admin_ids: Iterable[int] = (),
     ):
         self.repos = repos
+        self.admin_ids = tuple(admin_ids)
         self.settings = settings
         self.catalog = catalog
         self._now = clock
 
     # ------------------------------------------------------------------ клиент
 
-    async def current_shift_orders(self, user_id: int, service: Service) -> list[Order]:
-        shift = current_shift(self._now(), await self.settings.schedule(service))
-        if not shift:
-            return []
-        return await self.repos.orders.list_for_shift(user_id, service.id, shift.shift_date)
-
     async def check_can_order(self, actor: Actor, service: Service) -> date:
-        """Проверяет все условия оформления заявки; возвращает дату смены."""
+        """Проверяет условия оформления заявки; возвращает дату выноса, в который она попадёт.
+
+        Заказать можно в любое время: заявка попадает в ближайший вынос.
+        """
         require_active(actor)
         if not service.is_active:
             raise ValidationError("Услуга временно недоступна.")
         now = self._now()
-        schedule = await self.settings.schedule(service)
-        shift = current_shift(now, schedule)
+        shift = order_shift(now, await self.settings.schedule(service))
+        if not shift:
+            raise OutsideSchedule("Вынос мусора временно не проводится. Попробуйте позже.")
 
-        if shift:
-            existing = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift.shift_date)
-            if existing:
-                allowed = service.max_orders_per_shift + await self.repos.orders.count_exceptions(
-                    actor.user.id, service.id, shift.shift_date
-                )
-                if len(existing) >= allowed:
-                    raise AlreadyOrdered(existing[-1])
+        existing = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift.shift_date)
+        if existing:
+            allowed = service.max_orders_per_shift + await self.repos.orders.count_exceptions(
+                actor.user.id, service.id, shift.shift_date
+            )
+            if len(existing) >= allowed:
+                raise AlreadyOrdered(existing[-1])
 
-        address = await self.repos.user_addresses.get_current(actor.user.id)
-        if not address:
+        if not await self.repos.user_addresses.get_current(actor.user.id):
             raise NoAddress()
         if service.rules.get("requires_subscription", True):
             if not await self.repos.subscriptions.get_active_at(actor.user.id, service.id, now):
                 raise NoSubscription()
-
-        accepting = accepting_shift(now, schedule)
-        if not accepting:
-            raise OutsideSchedule(self._schedule_message(now, schedule, shift))
-        return accepting.shift_date
-
-    def _schedule_message(self, now: datetime, schedule, shift) -> str:
-        start = schedule.accept_start.strftime("%H:%M")
-        end = schedule.accept_end.strftime("%H:%M")
-        if shift:
-            text = f"Приём заявок на текущую смену завершён в {end}."
-        else:
-            text = f"Сейчас заявки не принимаются. Приём — в рабочие дни с {start} до {end}."
-        upcoming = next_shift(now, schedule)
-        if upcoming:
-            local = upcoming.starts_at.astimezone(schedule.tz)
-            if local.date() == now.astimezone(schedule.tz).date():
-                when = f"сегодня в {local:%H:%M}"
-            elif local.date() == now.astimezone(schedule.tz).date() + timedelta(days=1):
-                when = f"завтра в {local:%H:%M}"
-            else:
-                when = f"в {WEEKDAYS_GENITIVE[local.weekday()]}, {local:%d.%m} в {local:%H:%M}"
-            text += f"\nСледующий приём заявок начнётся {when}."
-        return text
+        return shift.shift_date
 
     async def create_order(self, actor: Actor, service: Service) -> Order:
-        """Создаёт заявку. Повторные/одновременные нажатия не создают дубликатов."""
+        """Создаёт заявку. Повторные/одновременные нажатия не создают дубликатов.
+
+        В режиме «назначает администратор» заявка сразу назначается администратору по умолчанию.
+        """
         now = self._now()
         async with self.repos.transaction():
             shift_date = await self.check_can_order(actor, service)
@@ -141,9 +117,30 @@ class OrderService:
                 orders = await self.repos.orders.list_for_shift(actor.user.id, service.id, shift_date)
                 raise AlreadyOrdered(orders[-1] if orders else None) from None
             await self.repos.orders.add_history(order_id, None, O.NEW, actor.tg_id, now, "Заявка создана клиентом")
-        order = await self.repos.orders.get(order_id)
-        assert order is not None
-        return order
+
+            if await self.settings.distribution_mode() == DistributionMode.MANUAL:
+                admin = await self.default_executor()
+                if admin:
+                    await self.repos.orders.transition(
+                        order_id, [O.NEW], O.ASSIGNED, expected_executor=None, executor_id=admin.id, assigned_at=now
+                    )
+                    await self.repos.orders.add_history(
+                        order_id, O.NEW, O.ASSIGNED, None, now, f"Назначена администратору {admin.display}"
+                    )
+        return await self._reload(order_id)
+
+    async def default_executor(self) -> User | None:
+        """Администратор, на которого по умолчанию назначаются заявки (первый в ADMIN_IDS)."""
+        if not self.admin_ids:
+            return None
+        tg_id = self.admin_ids[0]
+        return await self.repos.users.get_by_tg(tg_id) or await self.repos.users.upsert(tg_id, None, self._now())
+
+    async def assignees(self) -> list[User]:
+        """Кому можно назначить заявку: администраторы и активные исполнители."""
+        admins = [u for tg in self.admin_ids if (u := await self.repos.users.get_by_tg(tg))]
+        executors = [u for u in await self.repos.users.list(role=Role.EXECUTOR) if not u.is_blocked]
+        return admins + [u for u in executors if u.tg_id not in self.admin_ids]
 
     async def client_orders(self, actor: Actor, limit: int = 10) -> list[Order]:
         return await self.repos.orders.list(user_id=actor.user.id, newest_first=True, limit=limit)
@@ -157,7 +154,7 @@ class OrderService:
     # ------------------------------------------------------------- исполнитель
 
     async def can_executor_see(self, actor: Actor, order: Order) -> bool:
-        if order.executor_id == actor.user.id:
+        if order.executor_id == actor.user.id or actor.is_admin:
             return True
         return (
             order.status == O.NEW
@@ -225,6 +222,11 @@ class OrderService:
         now = self._now()
         async with self.repos.transaction():
             order = await self.get_for_executor(actor, order_id)
+            if order.status == O.ASSIGNED:
+                # «Выполнено» сразу из назначенной заявки: принятие фиксируется автоматически
+                await self._executor_step(actor, order, [O.ASSIGNED], O.ACCEPTED, accepted_at=now)
+                await self.repos.orders.add_history(order.id, O.ASSIGNED, O.ACCEPTED, actor.tg_id, now, None)
+                order = await self._reload(order.id)
             await self._executor_step(actor, order, [O.ACCEPTED, O.IN_PROGRESS], O.DONE, finished_at=now)
             await self.repos.orders.add_history(order.id, order.status, O.DONE, actor.tg_id, now, None)
         return await self._reload(order_id)
@@ -276,7 +278,8 @@ class OrderService:
     async def assign(self, actor: Actor, order_id: int, executor_id: int) -> OrderChange:
         require_admin(actor)
         executor = await self.repos.users.get(executor_id)
-        if not executor or executor.role != Role.EXECUTOR or executor.is_blocked:
+        is_assignee = executor and (executor.tg_id in self.admin_ids or executor.role == Role.EXECUTOR)
+        if not is_assignee or executor.is_blocked:
             raise ValidationError("Выбранный пользователь не является активным исполнителем.")
         now = self._now()
         async with self.repos.transaction():

@@ -162,7 +162,8 @@ async def _register_address(h: Harness, tg_id: int = CLIENT) -> None:
     await h.click(tg_id, AddrCb(action="pick", value=address.id).pack())
     await h.click(tg_id, AddrCb(action="section", value=3).pack())
     await h.text(tg_id, "5")
-    await h.text(tg_id, "45")
+    sent = await h.text(tg_id, "45")
+    assert "код домофона:" in h.all_text(sent) and "как его набирать" not in h.all_text(sent)
     await h.text(tg_id, "45K1234")
     await h.click(tg_id, AddrCb(action="skip").pack())
     sent = await h.click(tg_id, AddrCb(action="save").pack())
@@ -172,11 +173,14 @@ async def _register_address(h: Harness, tg_id: int = CLIENT) -> None:
 async def _pay_and_confirm(h: Harness, tg_id: int = CLIENT) -> None:
     week = next(tr for tr in await h.env.services.catalog.tariffs() if tr.title == "Неделя")
     sent = await h.click(tg_id, TariffCb(action="pick", tariff_id=week.id).pack())
-    assert "200 ₽" in h.all_text(sent) and "+7 900 000-00-00" in h.all_text(sent)
+    text = h.all_text(sent)
+    assert "299 ₽" in text and "+7 900 000-00-00" in text
+    assert "ничего указывать не нужно" in text and "№" not in text
     payment = await h.env.repos.payments.list(limit=1)
     payment_id = payment[0].id
     await h.click(tg_id, PayCb(action="paid", payment_id=payment_id).pack())
     sent = await h.photo(tg_id)
+    assert "№" not in h.all_text(sent, tg_id)
     assert any(isinstance(m, SendPhoto) and m.chat_id == ADMIN_TG for m in sent)
     assert (await h.env.repos.payments.get(payment_id)).status == PaymentStatus.AWAITING_CONFIRMATION
     service = await h.env.service()
@@ -184,7 +188,11 @@ async def _pay_and_confirm(h: Harness, tg_id: int = CLIENT) -> None:
 
     await h.click(ADMIN_TG, APayCb(action="confirm_ask", payment_id=payment_id).pack())
     sent = await h.click(ADMIN_TG, APayCb(action="confirm", payment_id=payment_id).pack())
-    assert "Оплата подтверждена" in h.all_text(sent, tg_id)
+    client_text = h.all_text(sent, tg_id)
+    assert "Оплата подтверждена" in client_text
+    # даты без времени: неделя с 21.10 по 27.10 включительно
+    assert "Начало: 21.10.2026" in client_text and "Окончание: 27.10.2026" in client_text
+    assert "20:00" not in client_text
     # повторное нажатие не создаёт вторую подписку
     await h.click(ADMIN_TG, APayCb(action="confirm", payment_id=payment_id).pack())
     assert await h.env.db.fetchval("SELECT COUNT(*) FROM subscriptions") == 1
@@ -192,8 +200,10 @@ async def _pay_and_confirm(h: Harness, tg_id: int = CLIENT) -> None:
 
 async def test_start_without_name(h):
     sent = await h.text(CLIENT, "/start")
-    assert "Здравствуйте" in h.all_text(sent)
-    assert "укажите адрес" in h.all_text(sent)
+    text = h.all_text(sent)
+    assert "Здравствуйте" not in text
+    assert "ежедневно с 19:00 до 02:00" in text
+    assert "укажите адрес" in text
 
 
 async def test_menu_button_interrupts_form(h):
@@ -207,7 +217,7 @@ async def test_menu_button_interrupts_form(h):
     await h.click(CLIENT, AddrCb(action="section", value=1).pack())
     sent = await h.text(CLIENT, t.BTN_TARIFFS)
     assert "Тарифы на вынос мусора" in h.all_text(sent)
-    assert "600 ₽" in h.all_text(sent)
+    assert "999 ₽" in h.all_text(sent)
 
 
 async def test_full_client_executor_admin_flow(h):
@@ -224,66 +234,93 @@ async def test_full_client_executor_admin_flow(h):
     await _pay_and_confirm(h)
 
     sent = await h.text(CLIENT, t.BTN_SUBSCRIPTION)
-    assert "Подписка активна" in h.all_text(sent)
+    assert "Подписка активна" in h.all_text(sent) and "27.10.2026" in h.all_text(sent)
 
     sent = await h.text(CLIENT, t.BTN_ORDER)
-    assert "Выставьте пакет" in h.all_text(sent)
+    assert "Выставьте пакет" in h.all_text(sent) and "сегодня с 19:00 до 02:00" in h.all_text(sent)
     sent = await h.click(CLIENT, OrderCb(action="placed").pack())
     assert "Пакет уже стоит у двери. Создать заявку на вынос?" in h.all_text(sent)
     sent = await h.click(CLIENT, OrderCb(action="confirm").pack())
-    assert "Новая заявка" in h.all_text(sent, ADMIN_TG)
+    # клиенту — ровно одно сообщение: статус и когда заберут, без номера, смены, адреса
+    client_msgs = [m for m in sent if isinstance(m, (SendMessage, EditMessageText)) and m.chat_id in (CLIENT, None)]
+    assert len(client_msgs) == 1, client_msgs
+    card = client_msgs[0].text
+    assert "Ожидает выноса" in card and "Заберём: сегодня с 19:00 до 02:00" in card
+    for word in ("№", "Смена", "смен", "Создана", "Адрес", "Торговая"):
+        assert word not in card, word
+    # заявка сразу на администраторе, у него — кнопки исполнителя
+    admin_msgs = [m for m in sent if isinstance(m, SendMessage) and m.chat_id == ADMIN_TG]
+    assert "Новая заявка" in admin_msgs[0].text and "Назначен" in admin_msgs[0].text
+    assert "Выполнено" in str(admin_msgs[0].reply_markup)
     order = (await env.repos.orders.list())[0]
+    admin_user = await env.repos.users.get_by_tg(ADMIN_TG)
+    assert order.executor_id == admin_user.id
 
-    # повторное подтверждение — дубля нет, показывается существующая заявка
+    # повторное подтверждение — дубля нет, показывается существующая заявка без слов про смену
     sent = await h.click(CLIENT, OrderCb(action="confirm").pack())
-    assert "уже создана" in h.all_text(sent)
+    assert "уже заказали" in h.all_text(sent) and "смен" not in h.all_text(sent)
     assert await env.db.fetchval("SELECT COUNT(*) FROM orders") == 1
 
-    # администратор назначает роль исполнителя и заявку
+    # администратор назначает роль исполнителя и передаёт ему заявку
     executor = await env.repos.users.get_by_tg(EXECUTOR)
     sent = await h.click(ADMIN_TG, AUserCb(action="role", user_id=executor.id).pack())
     assert "роль исполнителя" in h.all_text(sent, EXECUTOR)
-    sent = await h.click(ADMIN_TG, AOrderCb(action="assign", order_id=order.id).pack())
+    await h.click(ADMIN_TG, AOrderCb(action="assign", order_id=order.id).pack())
     sent = await h.click(ADMIN_TG, AOrderCb(action="assign_to", order_id=order.id, arg=executor.id).pack())
-    assert "Вам назначена заявка" in h.all_text(sent, EXECUTOR)
-    assert "45K1234" in h.all_text(sent, EXECUTOR)
+    executor_text = h.all_text(sent, EXECUTOR)
+    assert "Вам назначена заявка" in executor_text and "45K1234" in executor_text and "№" not in executor_text
+    # администратор остаётся в списке исполнителей и может забрать заявку обратно
+    sent = await h.click(ADMIN_TG, AOrderCb(action="assign", order_id=order.id).pack())
+    assert "👑" in str(sent[-1].reply_markup)
 
-    # исполнитель
+    # исполнитель: статусы «принят»/«в работе» клиенту не сообщаются
     sent = await h.text(EXECUTOR, t.BTN_EX_ASSIGNED)
-    assert f"№{order.id}" in str(sent[-1].reply_markup)
+    assert "Торговая" in str(sent[-1].reply_markup) and "№" not in str(sent[-1].reply_markup)
     sent = await h.click(EXECUTOR, ExecCb(action="accept", order_id=order.id).pack())
-    assert "принял заявку" in h.all_text(sent, CLIENT)
-    await h.click(EXECUTOR, ExecCb(action="start", order_id=order.id).pack())
+    assert not [m for m in sent if isinstance(m, SendMessage) and m.chat_id == CLIENT]
+    sent = await h.click(EXECUTOR, ExecCb(action="start", order_id=order.id).pack())
+    assert not [m for m in sent if isinstance(m, SendMessage) and m.chat_id == CLIENT]
     sent = await h.click(EXECUTOR, ExecCb(action="done", order_id=order.id).pack())
     assert "Мусор вынесен" in h.all_text(sent, CLIENT)
     assert (await env.repos.orders.get(order.id)).status == OrderStatus.DONE
 
-    # клиент видит свои заказы
+    # клиент видит свои заказы — без номеров
     sent = await h.text(CLIENT, t.BTN_MY_ORDERS)
-    assert f"№{order.id}" in h.all_text(sent)
+    assert "№" not in h.all_text(sent) and "Мусор вынесен" in h.all_text(sent)
     sent = await h.click(CLIENT, OrderCb(action="view", order_id=order.id).pack())
-    assert "Выполнен" in h.all_text(sent)
+    assert "Забрали: 21.10.2026" in h.all_text(sent)
 
-    # следующая смена: не удалось выполнить с комментарием
+    # следующий вынос: администратор сам выносит мусор по своей заявке
     env.clock.set(2026, 10, 22, 19, 30)
     await h.text(CLIENT, t.BTN_ORDER)
     await h.click(CLIENT, OrderCb(action="confirm").pack())
     second = (await env.repos.orders.list(newest_first=True))[0]
-    assert second.id != order.id
-    await h.click(ADMIN_TG, AOrderCb(action="assign_to", order_id=second.id, arg=executor.id).pack())
-    await h.click(EXECUTOR, ExecCb(action="fail", order_id=second.id).pack())
-    await h.click(EXECUTOR, ExecFailCb(order_id=second.id, reason="other").pack())
+    assert second.id != order.id and second.executor_id == admin_user.id
+    sent = await h.text(ADMIN_TG, t.BTN_A_MY_ORDERS)
+    assert "Назначенные" in str(sent[-1].reply_markup)
+    sent = await h.click(ADMIN_TG, ExecCb(action="done", order_id=second.id).pack())
+    assert "Мусор вынесен" in h.all_text(sent, CLIENT)
+
+    # ещё один вынос: исполнитель не смог выполнить, комментарий обязателен
+    env.clock.set(2026, 10, 23, 19, 30)
+    await h.text(CLIENT, t.BTN_ORDER)
+    await h.click(CLIENT, OrderCb(action="confirm").pack())
+    third = (await env.repos.orders.list(newest_first=True))[0]
+    await h.click(ADMIN_TG, AOrderCb(action="assign_to", order_id=third.id, arg=executor.id).pack())
+    await h.click(EXECUTOR, ExecCb(action="fail", order_id=third.id).pack())
+    await h.click(EXECUTOR, ExecFailCb(order_id=third.id, reason="other").pack())
     sent = await h.text(EXECUTOR, "Пакет порван")
     client_text = h.all_text(sent, CLIENT)
-    assert "Не удалось выполнить" in client_text and "Пакет порван" in client_text
+    assert "Не удалось вынести" in client_text and "Пакет порван" in client_text
     assert "не удалось выполнить" in h.all_text(sent, ADMIN_TG)
 
 
 async def test_admin_screens(h):
     env = h.env
     await h.text(ADMIN_TG, "/start")
-    for button in (t.BTN_A_ORDERS, t.BTN_A_PAYMENTS, t.BTN_A_USERS, t.BTN_A_TARIFFS, t.BTN_A_SCHEDULE,
-                   t.BTN_A_ADDRESSES, t.BTN_A_SBP, t.BTN_A_SETTINGS, t.BTN_A_STATS, t.BTN_A_EXPORT):
+    for button in (t.BTN_A_MY_ORDERS, t.BTN_A_ORDERS, t.BTN_A_PAYMENTS, t.BTN_A_USERS, t.BTN_A_TARIFFS,
+                   t.BTN_A_SCHEDULE, t.BTN_A_ADDRESSES, t.BTN_A_SBP, t.BTN_A_SETTINGS, t.BTN_A_STATS,
+                   t.BTN_A_EXPORT):
         sent = await h.text(ADMIN_TG, button)
         assert sent, button
     await h.click(ADMIN_TG, AOrderCb(action="list").pack())
@@ -303,11 +340,20 @@ async def test_admin_screens(h):
     assert (await env.services.catalog.tariff(tariff.id)).price_rub == 250
 
     # неверное время — остаёмся в режиме ввода
-    await h.click(ADMIN_TG, ASchedCb(action="time", value="accept_end").pack())
+    await h.click(ADMIN_TG, ASchedCb(action="time", value="order_cutoff").pack())
     sent = await h.text(ADMIN_TG, "99:99")
     assert "ЧЧ:ММ" in h.all_text(sent)
     sent = await h.text(ADMIN_TG, "00:30")
     assert "Сохранено" in h.all_text(sent)
+
+    # новое время и дни выноса сразу видны клиенту
+    await h.click(ADMIN_TG, ASchedCb(action="time", value="pickup_start").pack())
+    await h.text(ADMIN_TG, "18:00")
+    await h.click(ADMIN_TG, ASchedCb(action="day", value="6").pack())
+    sent = await h.text(CLIENT, "/start")
+    assert "с 18:00 до 02:00" in h.all_text(sent) and "Пн, Вт, Ср, Чт, Пт, Сб" in h.all_text(sent)
+    sent = await h.text(CLIENT, t.BTN_HELP)
+    assert "с 18:00 до 02:00" in h.all_text(sent)
 
 
 async def test_non_admin_cannot_use_admin_callbacks(h):

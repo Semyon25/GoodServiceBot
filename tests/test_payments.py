@@ -6,6 +6,8 @@ from bot.db.connection import IntegrityError
 from bot.domain.enums import PaymentStatus, SubscriptionStatus
 from bot.domain.errors import AccessDenied, InvalidTransition, NotFound, PaymentPending, ValidationError
 
+from .conftest import msk
+
 
 async def _tariff(env, title):
     return next(t for t in await env.services.catalog.tariffs() if t.title == title)
@@ -13,7 +15,7 @@ async def _tariff(env, title):
 
 async def test_default_tariffs(env):
     tariffs = {t.title: (t.price_rub, t.duration_days) for t in await env.services.catalog.tariffs()}
-    assert tariffs == {"Неделя": (200, 7), "Месяц": (600, 30)}
+    assert tariffs == {"Неделя": (299, 7), "Месяц": (999, 30)}
 
 
 async def test_paid_button_does_not_activate_subscription(env):
@@ -21,7 +23,7 @@ async def test_paid_button_does_not_activate_subscription(env):
     service = await env.service()
     payment = await env.services.payments.select_tariff(client, (await _tariff(env, "Неделя")).id)
     assert payment.status == PaymentStatus.AWAITING_PAYMENT
-    assert payment.amount_rub == 200
+    assert payment.amount_rub == 299
 
     payment, changed = await env.services.payments.submit_proof(client, payment.id, "photo", "f1", "чек")
     assert changed and payment.status == PaymentStatus.AWAITING_CONFIRMATION
@@ -39,9 +41,10 @@ async def test_admin_confirmation_activates_subscription(env):
     assert payment.status == PaymentStatus.CONFIRMED
     assert payment.confirmed_by_tg == (await env.admin()).tg_id
     assert payment.confirmed_at == env.clock()
-    assert sub.starts_at == env.clock()
-    assert sub.ends_at == env.clock() + timedelta(days=30)
-    assert sub.amount_rub == payment.amount_rub == 600
+    # подписка действует целыми днями: с начала дня подтверждения, 30 календарных дней
+    assert sub.starts_at == msk(2026, 10, 21, 0, 0)
+    assert sub.ends_at == msk(2026, 11, 20, 0, 0)
+    assert sub.amount_rub == payment.amount_rub == 999
     assert (await env.services.subscriptions.active(client.user.id, service.id)).id == sub.id
 
 
@@ -70,7 +73,7 @@ async def test_db_rejects_subscription_amount_mismatch_and_unconfirmed(env):
     payment = await env.services.payments.select_tariff(client, tariff.id)
     with pytest.raises(Exception, match="payment_not_confirmed"):
         await env.repos.subscriptions.create(
-            client.user.id, tariff.service_id, tariff.id, payment.id, "x", 200, env.clock(),
+            client.user.id, tariff.service_id, tariff.id, payment.id, "x", 299, env.clock(),
             env.clock() + timedelta(days=7), env.clock(),
         )
     await env.services.payments.confirm(await env.admin(), payment.id)
@@ -98,7 +101,7 @@ async def test_tariff_change_does_not_affect_paid_subscription(env):
     _, sub = await env.subscribe(client, "Неделя")
     await env.services.catalog.update_tariff(admin, tariff.id, price_rub=350, duration_days=10)
     reloaded = await env.repos.subscriptions.get(sub.id)
-    assert (reloaded.amount_rub, reloaded.ends_at) == (200, sub.ends_at)
+    assert (reloaded.amount_rub, reloaded.ends_at) == (299, sub.ends_at)
 
 
 async def test_tariff_change_after_payment_created_keeps_payment_amount(env):
@@ -108,7 +111,7 @@ async def test_tariff_change_after_payment_created_keeps_payment_amount(env):
     payment = await env.services.payments.select_tariff(client, tariff.id)
     await env.services.catalog.update_tariff(admin, tariff.id, price_rub=350)
     _, sub = await env.services.payments.confirm(admin, payment.id)
-    assert sub.amount_rub == 200
+    assert sub.amount_rub == 299
 
 
 async def test_reject_payment(env):
@@ -162,7 +165,7 @@ async def test_pending_confirmation_blocks_new_payment(env):
     # пока не оплачен — выбор другого тарифа меняет тот же платёж
     month = await _tariff(env, "Месяц")
     same = await env.services.payments.select_tariff(client, month.id)
-    assert same.id == payment.id and same.amount_rub == 600
+    assert same.id == payment.id and same.amount_rub == 999
     await env.services.payments.submit_proof(client, payment.id, "photo", "f", None)
     with pytest.raises(PaymentPending):
         await env.services.payments.select_tariff(client, tariff.id)
@@ -184,14 +187,16 @@ async def test_only_admin_can_confirm_and_clients_see_only_own(env):
 
 async def test_subscription_reminder_and_expiry_notifications(env):
     client = await env.client_with_address()
-    await env.subscribe(client, "Неделя")  # 21.10 20:00 → 28.10 20:00
-    env.clock.set(2026, 10, 27, 19, 0)
+    await env.subscribe(client, "Неделя")  # действует 21.10–27.10 включительно
+    env.clock.set(2026, 10, 26, 11, 0)
     assert await env.services.subscriptions.process_due() == []
-    env.clock.set(2026, 10, 27, 20, 30)
+    env.clock.set(2026, 10, 26, 12, 30)  # накануне последнего дня
     events = await env.services.subscriptions.process_due()
     assert [e.kind for e in events] == ["reminder"]
     assert await env.services.subscriptions.process_due() == []  # не дублируется
-    env.clock.set(2026, 10, 28, 20, 1)
+    env.clock.set(2026, 10, 28, 9, 0)  # ночью и рано утром не беспокоим
+    assert await env.services.subscriptions.process_due() == []
+    env.clock.set(2026, 10, 28, 10, 1)
     events = await env.services.subscriptions.process_due()
     assert [e.kind for e in events] == ["expired"]
     assert await env.services.subscriptions.process_due() == []

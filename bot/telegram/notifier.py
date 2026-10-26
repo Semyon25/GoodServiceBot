@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from typing import Iterable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError, TelegramRetryAfter
@@ -17,17 +18,17 @@ from bot.services.payments import SubscriptionEvent
 
 from . import texts as t
 from .callbacks import AOrderCb, ExecCb, TariffCb
-from .cards import admin_order_kb, admin_payment_kb, client_order_kb, executor_order_kb
+from .cards import admin_order_kb, admin_payment_kb, executor_order_kb
 from .keyboards import client_menu, executor_menu, rows
 
 log = logging.getLogger(__name__)
 
 
 class Notifier:
-    def __init__(self, bot: Bot, services: Services, admin_ids: frozenset[int]):
+    def __init__(self, bot: Bot, services: Services, admin_ids: Iterable[int]):
         self.bot = bot
         self.services = services
-        self.admin_ids = admin_ids
+        self.admin_ids = tuple(admin_ids)
         self.tz = services.tz
         self._error_sent_at: dict[str, float] = {}
 
@@ -70,54 +71,59 @@ class Notifier:
 
     # --------------------------------------------------------------- заказы
 
-    async def order_created(self, order: Order, client: User) -> None:
-        await self.send(
-            client.tg_id,
-            f"✅ Заявка №{order.id} на вынос мусора создана.\n"
-            "Мы сообщим, когда исполнитель примет её и когда мусор будет вынесен.",
-            client_order_kb(order),
+    async def _admin_card(self, order: Order, header: str) -> None:
+        """Карточка заявки каждому администратору; назначенному — с кнопками исполнителя."""
+        users = await self.services.orders.users_by_id([order.user_id, order.executor_id])
+        text = header + t.order_card(
+            order, self.tz, client=users.get(order.user_id), executor=users.get(order.executor_id)
         )
-        await self.to_admins(
-            "🆕 Новая заявка\n\n" + t.order_card(order, self.tz, client=client), admin_order_kb(order, back=False)
-        )
+        for admin_id in self.admin_ids:
+            admin = await self.services.repos.users.get_by_tg(admin_id)
+            await self.send(admin_id, text, admin_order_kb(order, back=False, viewer_id=admin.id if admin else None))
+
+    @staticmethod
+    def _order_place(order: Order) -> str:
+        return f"{t.h(order.address_title)}, секция {order.section}, кв. {t.h(order.apartment)}"
+
+    async def order_created(self, order: Order) -> None:
+        """Клиент получает ответ в самом диалоге заказа, здесь — только сотрудники."""
+        await self._admin_card(order, "🆕 Новая заявка\n\n")
         if await self.services.settings.distribution_mode() == DistributionMode.POOL:
             executors = await self.services.users.list_executors()
             markup = rows([("Открыть заявку", ExecCb(action="view", order_id=order.id, view="new").pack())])
             for executor in executors:
-                await self.send(
-                    executor.tg_id,
-                    f"🆕 Доступна новая заявка №{order.id}: {t.h(order.address_title)}, секция {order.section}",
-                    markup,
-                )
+                await self.send(executor.tg_id, f"🆕 Доступна новая заявка: {self._order_place(order)}", markup)
 
     async def order_assigned(self, change: OrderChange) -> None:
         order = change.order
-        await self.to_user(
-            order.executor_id,
-            "📌 Вам назначена заявка\n\n" + t.order_card(order, self.tz),
-            executor_order_kb(order, back_view="assigned"),
-        )
+        executor = await self.services.repos.users.get(order.executor_id) if order.executor_id else None
+        if executor and executor.tg_id in self.admin_ids:
+            client = await self.services.repos.users.get(order.user_id)
+            await self.send(
+                executor.tg_id,
+                "📌 Вам назначена заявка\n\n" + t.order_card(order, self.tz, client=client),
+                admin_order_kb(order, back=False, viewer_id=executor.id),
+            )
+        elif executor:
+            await self.send(
+                executor.tg_id,
+                "📌 Вам назначена заявка\n\n" + t.order_card(order, self.tz, numbered=False),
+                executor_order_kb(order, back_view="assigned"),
+            )
         if change.previous_executor_id and change.previous_executor_id != order.executor_id:
             await self.to_user(
                 change.previous_executor_id,
-                f"🔁 Заявка №{order.id} переназначена другому исполнителю. Выполнять её не нужно.",
+                f"🔁 Заявка ({self._order_place(order)}) передана другому исполнителю. Выполнять её не нужно.",
             )
 
-    async def order_accepted(self, order: Order) -> None:
-        await self.to_user(
-            order.user_id,
-            f"👍 Исполнитель принял заявку №{order.id} и скоро заберёт пакет.",
-            client_order_kb(order),
-        )
-
     async def order_done(self, order: Order) -> None:
-        await self.to_user(order.user_id, f"🎉 Мусор вынесен! Заявка №{order.id} выполнена. Спасибо!")
+        await self.to_user(order.user_id, "🎉 Мусор вынесен! Спасибо, что пользуетесь сервисом.")
 
     async def order_failed(self, order: Order, executor: User) -> None:
         reason = t.h(t.fail_text(order) or "")
         await self.to_user(
             order.user_id,
-            f"😔 Не удалось выполнить заявку №{order.id}.\nПричина: {reason}\n\n"
+            f"😔 Не удалось вынести мусор.\nПричина: {reason}\n\n"
             "Если есть вопросы, напишите администратору через раздел «Помощь».",
         )
         await self.to_admins(
@@ -129,12 +135,12 @@ class Notifier:
         order = change.order
         await self.to_user(
             order.user_id,
-            f"❌ Заявка №{order.id} отменена администратором.\nПричина: {t.h(order.cancel_reason)}",
+            f"❌ Заявка на вынос мусора отменена администратором.\nПричина: {t.h(order.cancel_reason)}",
         )
         if change.previous_executor_id:
             await self.to_user(
                 change.previous_executor_id,
-                f"❌ Заявка №{order.id} отменена администратором. Выполнять её не нужно.\n"
+                f"❌ Заявка ({self._order_place(order)}) отменена администратором. Выполнять её не нужно.\n"
                 f"Причина: {t.h(order.cancel_reason)}",
             )
 
@@ -172,16 +178,16 @@ class Notifier:
             payment.user_id,
             f"✅ Оплата подтверждена!\n\n"
             f"Подписка: <b>{t.h(sub.tariff_title)}</b>\n"
-            f"Начало: {t.fmt_dt(sub.starts_at, self.tz)}\n"
-            f"Окончание: {t.fmt_dt(sub.ends_at, self.tz)}\n\n"
-            "Теперь в рабочую смену можно заказывать вынос мусора.",
+            f"Начало: {t.subscription_first_day(sub, self.tz)}\n"
+            f"Окончание: {t.subscription_last_day(sub, self.tz)} (включительно)\n\n"
+            "Теперь можно заказывать вынос мусора.",
         )
 
     async def payment_rejected(self, payment: Payment) -> None:
         reason = f"\nПричина: {t.h(payment.reject_reason)}" if payment.reject_reason else ""
         await self.to_user(
             payment.user_id,
-            f"⛔ Оплата по платежу №{payment.id} на {payment.amount_rub} ₽ не подтверждена.{reason}\n\n"
+            f"⛔ Оплата на {payment.amount_rub} ₽ не подтверждена.{reason}\n\n"
             "Если вы уже перевели деньги, напишите администратору через раздел «Помощь». "
             "Также можно пройти оплату заново.",
             rows([("💳 Тарифы и оплата", TariffCb(action="list").pack())]),
@@ -190,7 +196,7 @@ class Notifier:
     async def payment_refunded(self, payment: Payment) -> None:
         await self.to_user(
             payment.user_id,
-            f"↩️ По платежу №{payment.id} оформлен возврат {payment.amount_rub} ₽.\n"
+            f"↩️ По оплате «{t.h(payment.tariff_title)}» оформлен возврат {payment.amount_rub} ₽.\n"
             f"Причина: {t.h(payment.refund_reason)}\nСвязанная подписка аннулирована.",
         )
 
@@ -200,8 +206,8 @@ class Notifier:
         markup = rows([("💳 Продлить подписку", TariffCb(action="list").pack())])
         if event.kind == "reminder":
             text = (
-                f"⏳ Ваша подписка «{t.h(event.subscription.tariff_title)}» заканчивается "
-                f"{t.fmt_dt(event.subscription.ends_at, self.tz)}.\n"
+                f"⏳ Ваша подписка «{t.h(event.subscription.tariff_title)}» действует до "
+                f"{t.subscription_last_day(event.subscription, self.tz)} включительно.\n"
                 "Чтобы не прерывать обслуживание, оплатите следующий период заранее — "
                 "он начнётся сразу после окончания текущего."
             )

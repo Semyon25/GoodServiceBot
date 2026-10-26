@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from bot.db.repositories import Repositories
@@ -19,7 +19,7 @@ class Services:
     def __init__(
         self,
         repos: Repositories,
-        admin_ids: frozenset[int],
+        admin_ids: Iterable[int],
         tz: ZoneInfo,
         clock: Callable[[], datetime],
     ):
@@ -27,10 +27,11 @@ class Services:
         self.tz = tz
         self.clock = clock
         self.settings = SettingsService(repos, tz, clock)
-        self.users = UserService(repos, admin_ids, clock)
+        admin_ids = tuple(admin_ids)
+        self.users = UserService(repos, frozenset(admin_ids), clock)
         self.addresses = AddressService(repos, clock)
         self.catalog = CatalogService(repos, clock)
-        self.payments = PaymentService(repos, self.catalog, clock)
+        self.payments = PaymentService(repos, self.catalog, clock, tz)
         self.subscriptions = SubscriptionService(repos, clock)
-        self.orders = OrderService(repos, self.settings, self.catalog, clock)
+        self.orders = OrderService(repos, self.settings, self.catalog, clock, admin_ids)
         self.reports = ReportService(repos, tz, clock)
